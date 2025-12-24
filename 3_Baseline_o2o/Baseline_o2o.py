@@ -60,13 +60,16 @@ def prepare(dataset):
     data["min_cost_of_manjian"] = data["Discount_rate"].map(
         lambda x: -1 if ":" not in str(x) else int(str(x).split(":")[0])
     )  # 满减的最低消费
+    data["high_discount"] = data["discount_rate"].map(lambda x: 1 if x >= 0.85 else 0)
     # 距离处理
+    data["Distance"] = pd.to_numeric(data["Distance"], errors="coerce")
     data["Distance"].fillna(-1, inplace=True)  # 空距离填充为-1
     data["null_distance"] = data["Distance"].map(lambda x: 1 if x == -1 else 0)
     # 时间处理
     data["date_received"] = pd.to_datetime(data["Date_received"], format="%Y%m%d")
     if "Date" in data.columns.tolist():  # off_train
         data["date"] = pd.to_datetime(data["Date"], format="%Y%m%d")
+        data["date_month"] = data["date"].dt.month
     # 返回
     return data
 
@@ -214,6 +217,7 @@ def get_week_feature(label_field):
     feature["is_weekend"] = feature["week"].map(
         lambda x: 1 if x == 5 or x == 6 else 0
     )  # 判断领券日是否为休息日
+    feature["receive_month"] = feature["date_received"].dt.month
     feature = pd.concat(
         [feature, pd.get_dummies(feature["week"], prefix="week")], axis=1
     )  # one-hot离散星期几
@@ -255,6 +259,12 @@ def build_history_features(history_field):
     user_feat["user_distance_max"] = (
         user_grp["Distance"].apply(lambda x: x.replace(-1, np.nan).max()).values
     )
+    user_feat["user_discount_mean"] = user_grp["discount_rate"].mean().values
+    user_feat["user_discount_max"] = user_grp["discount_rate"].max().values
+    user_feat["user_high_discount_ratio"] = safe_divide(
+        user_grp["high_discount"].sum().reset_index(drop=True),
+        user_feat["user_receive_cnt"],
+    )
     user_feat.fillna(0, inplace=True)
 
     # 商家维度
@@ -267,6 +277,13 @@ def build_history_features(history_field):
     )
     merchant_feat["merchant_user_cnt"] = merchant_grp["User_id"].nunique().values
     merchant_feat["merchant_coupon_cnt"] = merchant_grp["Coupon_id"].nunique().values
+    merchant_feat["merchant_discount_mean"] = (
+        merchant_grp["discount_rate"].mean().values
+    )
+    merchant_feat["merchant_high_discount_ratio"] = safe_divide(
+        merchant_grp["high_discount"].sum().reset_index(drop=True),
+        merchant_feat["merchant_receive_cnt"],
+    )
 
     # 优惠券维度
     coupon_grp = data.groupby("Coupon_id")
@@ -275,6 +292,11 @@ def build_history_features(history_field):
     coupon_feat["coupon_used_cnt"] = coupon_grp["used"].sum().values
     coupon_feat["coupon_used_rate"] = safe_divide(
         coupon_feat["coupon_used_cnt"], coupon_feat["coupon_receive_cnt"]
+    )
+    coupon_feat["coupon_discount"] = coupon_grp["discount_rate"].mean().values
+    coupon_feat["coupon_high_discount_ratio"] = safe_divide(
+        coupon_grp["high_discount"].sum().reset_index(drop=True),
+        coupon_feat["coupon_receive_cnt"],
     )
 
     # 用户-商家交互
@@ -290,6 +312,10 @@ def build_history_features(history_field):
     um_feat["um_used_rate"] = safe_divide(
         um_feat["um_used_cnt"], um_feat["um_receive_cnt"]
     )
+    um_feat["um_discount_mean"] = um_grp["discount_rate"].mean().values
+    um_feat["um_distance_mean"] = (
+        um_grp["Distance"].apply(lambda x: x.replace(-1, np.nan).mean()).values
+    )
 
     return {
         "user": user_feat,
@@ -297,6 +323,75 @@ def build_history_features(history_field):
         "coupon": coupon_feat,
         "um": um_feat,
     }, data[["User_id", "Coupon_id", "Date_received", "Date"]]
+
+
+def build_online_features(online_df):
+    """从线上行为构造用户/商家/优惠券/交互统计特征"""
+    if online_df is None or online_df.empty:
+        return {}
+
+    data = online_df.copy()
+    data["User_id"] = pd.to_numeric(data["User_id"], errors="coerce")
+    data["Merchant_id"] = pd.to_numeric(data["Merchant_id"], errors="coerce")
+    data["Coupon_id"] = pd.to_numeric(data["Coupon_id"], errors="coerce")
+    data.dropna(subset=["User_id", "Merchant_id", "Coupon_id"], inplace=True)
+    data = data.astype({"User_id": int, "Merchant_id": int, "Coupon_id": int})
+    # Action: 0点击 1购买 2领券
+    data["is_click"] = (data["Action"] == 0).astype(int)
+    data["is_buy"] = (data["Action"] == 1).astype(int)
+    data["is_receive"] = (data["Action"] == 2).astype(int)
+
+    user_grp = data.groupby("User_id")
+    user_feat = pd.DataFrame({"User_id": user_grp.size().index})
+    user_feat["user_online_click"] = user_grp["is_click"].sum().values
+    user_feat["user_online_buy"] = user_grp["is_buy"].sum().values
+    user_feat["user_online_receive"] = user_grp["is_receive"].sum().values
+    user_feat["user_online_buy_rate"] = safe_divide(
+        user_feat["user_online_buy"],
+        user_feat["user_online_click"] + user_feat["user_online_receive"],
+    )
+
+    merchant_grp = data.groupby("Merchant_id")
+    merchant_feat = pd.DataFrame({"Merchant_id": merchant_grp.size().index})
+    merchant_feat["merchant_online_click"] = merchant_grp["is_click"].sum().values
+    merchant_feat["merchant_online_buy"] = merchant_grp["is_buy"].sum().values
+    merchant_feat["merchant_online_receive"] = merchant_grp["is_receive"].sum().values
+    merchant_feat["merchant_online_buy_rate"] = safe_divide(
+        merchant_feat["merchant_online_buy"],
+        merchant_feat["merchant_online_click"]
+        + merchant_feat["merchant_online_receive"],
+    )
+
+    coupon_grp = data.groupby("Coupon_id")
+    coupon_feat = pd.DataFrame({"Coupon_id": coupon_grp.size().index})
+    coupon_feat["coupon_online_receive"] = coupon_grp["is_receive"].sum().values
+    coupon_feat["coupon_online_buy"] = coupon_grp["is_buy"].sum().values
+    coupon_feat["coupon_online_buy_rate"] = safe_divide(
+        coupon_feat["coupon_online_buy"],
+        coupon_feat["coupon_online_receive"],
+    )
+
+    um_grp = data.groupby(["User_id", "Merchant_id"])
+    um_feat = pd.DataFrame(
+        {
+            "User_id": [u for u, _ in um_grp.size().index],
+            "Merchant_id": [m for _, m in um_grp.size().index],
+        }
+    )
+    um_feat["um_online_click"] = um_grp["is_click"].sum().values
+    um_feat["um_online_buy"] = um_grp["is_buy"].sum().values
+    um_feat["um_online_receive"] = um_grp["is_receive"].sum().values
+    um_feat["um_online_buy_rate"] = safe_divide(
+        um_feat["um_online_buy"],
+        um_feat["um_online_click"] + um_feat["um_online_receive"],
+    )
+
+    return {
+        "user": user_feat,
+        "merchant": merchant_feat,
+        "coupon": coupon_feat,
+        "um": um_feat,
+    }
 
 
 def add_user_recency(label_field):
@@ -333,7 +428,7 @@ def dedup_result(result_df):
     return result_df
 
 
-def get_dataset(history_field, middle_field, label_field):
+def get_dataset(history_field, middle_field, label_field, online_feats=None):
     """构造数据集
 
     Args:
@@ -348,7 +443,8 @@ def get_dataset(history_field, middle_field, label_field):
     week_feat = get_week_feature(base)
     simple_feat = get_simple_feature(base)
     recency_feat = add_user_recency(base)
-    history_feats, _ = build_history_features(history_field)
+    history_full = pd.concat([history_field, middle_field], axis=0)
+    history_feats, _ = build_history_features(history_full)
 
     # 构造数据集
     share_characters = list(
@@ -372,20 +468,32 @@ def get_dataset(history_field, middle_field, label_field):
                 history_feats["um"], on=["User_id", "Merchant_id"], how="left"
             )
 
+    # 关联线上统计
+    if online_feats:
+        if "user" in online_feats:
+            dataset = dataset.merge(online_feats["user"], on="User_id", how="left")
+        if "merchant" in online_feats:
+            dataset = dataset.merge(
+                online_feats["merchant"], on="Merchant_id", how="left"
+            )
+        if "coupon" in online_feats:
+            dataset = dataset.merge(online_feats["coupon"], on="Coupon_id", how="left")
+        if "um" in online_feats:
+            dataset = dataset.merge(
+                online_feats["um"], on=["User_id", "Merchant_id"], how="left"
+            )
+
     # 删除无用属性并将label置于最后一列
+    drop_cols = ["Merchant_id", "Discount_rate", "date_received", "date_month"]
     if "Date" in dataset.columns.tolist():  # 表示训练集和验证集
-        dataset.drop(
-            ["Merchant_id", "Discount_rate", "Date", "date_received", "date"],
-            axis=1,
-            inplace=True,
-        )
+        drop_cols.append("Date")
+        drop_cols.append("date")
         label = dataset["label"].tolist()
         dataset.drop(["label"], axis=1, inplace=True)
         dataset["label"] = label
-    else:  # 表示测试集
-        dataset.drop(
-            ["Merchant_id", "Discount_rate", "date_received"], axis=1, inplace=True
-        )
+
+    # 某些切片缺少部分时间列，忽略缺失安全删除
+    dataset.drop(drop_cols, axis=1, inplace=True, errors="ignore")
 
     # 修正数据类型
     dataset["User_id"] = dataset["User_id"].map(int)
@@ -478,34 +586,44 @@ def model_lgb(train, valid=None, test=None):
     params = {
         "objective": "binary",
         "metric": "auc",
-        "learning_rate": 0.03,
-        "num_leaves": 31,
-        "feature_fraction": 0.8,
-        "bagging_fraction": 0.8,
+        "learning_rate": 0.05,
+        "num_leaves": 63,
+        "feature_fraction": 0.85,
+        "bagging_fraction": 0.85,
         "bagging_freq": 5,
         "max_depth": -1,
-        "min_data_in_leaf": 50,
+        "min_data_in_leaf": 30,
+        "lambda_l1": 0.0,
+        "lambda_l2": 1.0,
+        "min_gain_to_split": 0.0,
         "verbosity": -1,
     }
+
+    callbacks = [lgb.log_evaluation(200)]
+    if dvalid is not None:
+        callbacks.append(lgb.early_stopping(100, verbose=False))
 
     model = lgb.train(
         params,
         dtrain,
-        num_boost_round=1500,
+        num_boost_round=2500,
         valid_sets=valid_sets,
         valid_names=valid_names,
-        early_stopping_rounds=100 if dvalid is not None else None,
+        callbacks=callbacks,
     )
 
     result = {}
+    best_iter = (
+        model.best_iteration
+        if model.best_iteration is not None
+        else model.current_iteration()
+    )
     if dvalid is not None:
         result["valid_prob"] = model.predict(
-            valid[feature_cols], num_iteration=model.best_iteration
+            valid[feature_cols], num_iteration=best_iter
         )
     if test is not None:
-        test_prob = model.predict(
-            test[feature_cols], num_iteration=model.best_iteration
-        )
+        test_prob = model.predict(test[feature_cols], num_iteration=best_iter)
         predict = pd.DataFrame(test_prob, columns=["prob"])
         result["test_result"] = pd.concat(
             [test[["User_id", "Coupon_id", "Date_received"]], predict], axis=1
@@ -525,13 +643,26 @@ if __name__ == "__main__":
     base_dir = Path(__file__).resolve().parent.parent
     train_path = base_dir / "ccf_offline_stage1_train.csv"
     test_path = base_dir / "ccf_offline_stage1_test_revised.csv"
+    online_path = base_dir / "ccf_online_stage1_train.csv"
     output_dir = base_dir / "output_files"
     output_dir.mkdir(exist_ok=True)
     output_path = output_dir / "submission_lgb.csv"
 
     # 源数据
-    off_train = pd.read_csv(train_path)
-    off_test = pd.read_csv(test_path)
+    off_train = pd.read_csv(train_path, skipinitialspace=True)
+    off_test = pd.read_csv(test_path, skipinitialspace=True)
+    off_train.columns = off_train.columns.str.strip()
+    off_test.columns = off_test.columns.str.strip()
+    # 线上数据用于额外特征
+    online_feat_dict = {}
+    if online_path.exists():
+        online_df = pd.read_csv(online_path, skipinitialspace=True)
+        online_df.columns = online_df.columns.str.strip()
+        try:
+            online_feat_dict = build_online_features(online_df)
+            print("已加载线上行为特征")
+        except Exception as e:
+            print(f"线上数据特征构建失败: {e}")
 
     # 预处理
     off_train = prepare(off_train)
@@ -570,13 +701,26 @@ if __name__ == "__main__":
 
     # 构造训练集、验证集、测试集
     print("构造训练集")
-    train = get_dataset(train_history_field, train_middle_field, train_label_field)
+    train = get_dataset(
+        train_history_field,
+        train_middle_field,
+        train_label_field,
+        online_feats=online_feat_dict,
+    )
     print("构造验证集")
     validate = get_dataset(
-        validate_history_field, validate_middle_field, validate_label_field
+        validate_history_field,
+        validate_middle_field,
+        validate_label_field,
+        online_feats=online_feat_dict,
     )
     print("构造测试集")
-    test = get_dataset(test_history_field, test_middle_field, test_label_field)
+    test = get_dataset(
+        test_history_field,
+        test_middle_field,
+        test_label_field,
+        online_feats=online_feat_dict,
+    )
 
     # 线下验证（若可用）
     if lgb is not None:
