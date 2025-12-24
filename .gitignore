@@ -1,0 +1,76 @@
+# .gitignore for O2O practice project
+# Ignore Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+*.eggs/
+build/
+dist/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.env
+
+# Byte-compiled / optimized / DLL files
+*.pyc
+*.pyo
+*.pyd
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.coverage
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE / editor
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+*.swp
+*.swo
+*.docx
+
+# macOS
+.DS_Store
+
+# LaTeX artifacts (for `4_o2o_报告latex`)
+*.aux
+*.log
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.pdf
+
+# Data and outputs (ignore large/raw data and generated outputs)
+/input_files/
+/output_files/
+ccf_offline_stage1_train.csv
+ccf_offline_stage1_test_revised.csv
+ccf_online_stage1_train.csv
+sample_submission.csv
+
+# Logs
+*.log
+logs/
+
+# Misc
+*.bak
+*.tmp
+
+# Keep these patterns commented or adjust as needed
+# If you want to track specific CSVs, remove them from this file or add an exception like:
+# !sample_submission.csv

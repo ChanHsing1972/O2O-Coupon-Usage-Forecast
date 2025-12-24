@@ -1,0 +1,109 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{geometry}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{graphicx}
+
+\geometry{a4paper,left=20mm,right=20mm,top=20mm,bottom=20mm}
+\newcolumntype{P}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+\begin{document}
+
+\begin{center}
+    {\heiti % 从这里开始用黑体
+
+{\Huge \textbf{O2O优惠券使用预测}} \\[0.8cm]
+{\Huge \textbf{实践报告册}} \\[2.5cm]
+  \vspace{4cm}  
+    \renewcommand{\arraystretch}{1.8}
+\begin{tabular}{|p{4cm}|>{\centering\arraybackslash}p{8cm}|}
+
+        \hline
+        \textbf{学年学期：} & 2025-2026学年 第1学期 \\
+        \hline
+        \textbf{课程名称：} & 机器学习 \\
+        \hline
+        \textbf{学生学院：} & 智能软件与工程学院 \\
+        \hline
+        \textbf{专业班级：} &  \\
+        \hline
+        \textbf{学生学号：} & XXX \\
+        \hline
+        \textbf{学生姓名：} & XXX \\
+        \hline
+        \textbf{联系电话：} & XXX \\
+        \hline
+    \end{tabular}
+
+    } % 黑体到这里结束
+\end{center}
+
+
+\newpage
+
+{\songti
+
+{\songti
+\renewcommand{\arraystretch}{1.4}
+\begin{center}
+\begin{tabular}{|>{\centering\arraybackslash}p{6cm}|>{\centering\arraybackslash}p{8cm}|}
+    \hline
+    队伍名称和最佳得分 &
+    \begin{minipage}[c]{8cm}
+        \centering
+        截图展示，例如\\[0.5em]
+        \includegraphics[width=7cm]{submit.png} % 换成你的图片文件名
+    \end{minipage}
+    \\ \hline
+    成绩提交时间       & 最佳成绩提交时间 \\ \hline
+    实践名称           & O2O优惠券使用预测 \\ \hline
+\end{tabular}
+\end{center}
+}
+
+\vspace{0.8cm}
+
+\noindent 一、实践目的和要求
+
+\noindent 完成 O2O 优惠券使用预测阿里天池平台线上测评。
+
+\vspace{0.5cm}
+
+\noindent 二、实践设备
+
+\begin{enumerate}
+  \item 操作系统：Windows
+  \item 基本硬件配置要求：处理器 Intel i3、内存 8G；
+  \item Python 及其组件版本：
+  \begin{itemize}
+    \item Python 3.6.5 以上
+    \item NumPy 1.14.3 以上
+    \item Pandas 0.23.0 以上
+    \item Scikit-learn 0.19.1 以上
+    \item XGBoost 0.6
+    \item LightGBM 2.1.0
+  \end{itemize}
+\end{enumerate}
+
+\vspace{0.5cm}
+
+\noindent 三、实践内容
+
+\noindent 此处由你来填写。实践方法和步骤、实践过程原始记录（数据分析、图表的展示等）、实践结果（部分提交结果的记录）及分析等。
+
+
+例: 2025.11.25, 数据分析，对xx字段做了xx分析。。。结论。。。。
+
+
+例: 2025.12.01, 特征工程，做了xx特征，线上AUC达到了。。。
+
+
+\vspace{0.5cm}
+
+\noindent 四、学习心得
+
+\noindent 此处由你来填写。500 字左右对于此次实践的心得体会。
+
+} % songti 结束
+\end{document}
