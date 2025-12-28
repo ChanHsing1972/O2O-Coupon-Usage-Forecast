@@ -474,6 +474,36 @@ def add_uc_recency(label_field):
     return tmp
 
 
+def add_sequence_features(label_field):
+    """领取顺序特征：用户/用户-券维度的时间排序"""
+    tmp = label_field[["row_id", "User_id", "Coupon_id", "date_received"]].copy()
+    tmp.sort_values(["User_id", "date_received", "row_id"], inplace=True)
+    tmp["user_receive_rank"] = tmp.groupby("User_id")["date_received"].rank(
+        method="first"
+    )
+    tmp["user_receive_rev_rank"] = tmp.groupby("User_id")["date_received"].rank(
+        method="first", ascending=False
+    )
+
+    tmp.sort_values(["User_id", "Coupon_id", "date_received", "row_id"], inplace=True)
+    tmp["uc_receive_rank"] = tmp.groupby(["User_id", "Coupon_id"])[
+        "date_received"
+    ].rank(method="first")
+    tmp["uc_receive_rev_rank"] = tmp.groupby(["User_id", "Coupon_id"])[
+        "date_received"
+    ].rank(method="first", ascending=False)
+
+    return tmp[
+        [
+            "row_id",
+            "user_receive_rank",
+            "user_receive_rev_rank",
+            "uc_receive_rank",
+            "uc_receive_rev_rank",
+        ]
+    ]
+
+
 def evaluate_coupon_auc(df, prob_col="prob"):
     """按coupon_id分组求AUC的均值"""
     auc_list = []
@@ -531,6 +561,8 @@ def build_recent_window_features(base, history_full, windows=(7, 15, 30)):
         (["Merchant_id"], "merchant"),
         (["Coupon_id"], "coupon"),
         (["User_id", "Merchant_id"], "um"),
+        (["User_id", "Coupon_id"], "uc"),
+        (["Merchant_id", "Coupon_id"], "mc"),
     ]
     out = pd.DataFrame({"row_id": base["row_id"]})
     for keys, prefix in key_defs:
@@ -595,6 +627,7 @@ def get_dataset(history_field, middle_field, label_field, online_feats=None):
     recency_feat = add_user_recency(base)
     um_recency_feat = add_um_recency(base)
     uc_recency_feat = add_uc_recency(base)
+    seq_feat = add_sequence_features(base)
     history_full = pd.concat([history_field, middle_field], axis=0)
     history_feats, _ = build_history_features(history_full)
     recent_feats = build_recent_window_features(base, history_full, windows=(7, 15, 30))
@@ -607,6 +640,7 @@ def get_dataset(history_field, middle_field, label_field, online_feats=None):
     dataset = dataset.merge(recency_feat, on=["row_id", "User_id"], how="left")
     dataset = dataset.merge(um_recency_feat, on="row_id", how="left")
     dataset = dataset.merge(uc_recency_feat, on="row_id", how="left")
+    dataset = dataset.merge(seq_feat, on="row_id", how="left")
     dataset = dataset.merge(recent_feats, on="row_id", how="left")
 
     # 关联历史统计
