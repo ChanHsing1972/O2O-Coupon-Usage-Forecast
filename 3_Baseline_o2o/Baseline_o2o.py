@@ -61,10 +61,17 @@ def prepare(dataset):
         lambda x: -1 if ":" not in str(x) else int(str(x).split(":")[0])
     )  # 满减的最低消费
     data["high_discount"] = data["discount_rate"].map(lambda x: 1 if x >= 0.85 else 0)
+    data["discount_rate_sq"] = data["discount_rate"] * data["discount_rate"]
+    data["discount_bucket"] = pd.cut(
+        data["discount_rate"], bins=[-np.inf, 0.7, 0.8, 0.9, 1.0, np.inf], labels=False
+    )
     # 距离处理
     data["Distance"] = pd.to_numeric(data["Distance"], errors="coerce")
     data["Distance"].fillna(-1, inplace=True)  # 空距离填充为-1
     data["null_distance"] = data["Distance"].map(lambda x: 1 if x == -1 else 0)
+    data["distance_bucket"] = pd.cut(
+        data["Distance"], bins=[-np.inf, 0, 1, 2, 4, 9, np.inf], labels=False
+    )
     # 时间处理
     data["date_received"] = pd.to_datetime(data["Date_received"], format="%Y%m%d")
     if "Date" in data.columns.tolist():  # off_train
@@ -218,6 +225,13 @@ def get_week_feature(label_field):
         lambda x: 1 if x == 5 or x == 6 else 0
     )  # 判断领券日是否为休息日
     feature["receive_month"] = feature["date_received"].dt.month
+    feature["receive_day"] = feature["date_received"].dt.day
+    feature["receive_weekofmonth"] = (feature["receive_day"] - 1) // 7
+    feature["is_month_start"] = feature["date_received"].dt.is_month_start.astype(int)
+    feature["is_month_end"] = feature["date_received"].dt.is_month_end.astype(int)
+    # 周期特征（避免纯整数编码的序数偏差）
+    feature["week_sin"] = np.sin(2 * np.pi * feature["week"] / 7)
+    feature["week_cos"] = np.cos(2 * np.pi * feature["week"] / 7)
     feature = pd.concat(
         [feature, pd.get_dummies(feature["week"], prefix="week")], axis=1
     )  # one-hot离散星期几
@@ -317,11 +331,30 @@ def build_history_features(history_field):
         um_grp["Distance"].apply(lambda x: x.replace(-1, np.nan).mean()).values
     )
 
+    # 用户-券交互
+    uc_grp = data.groupby(["User_id", "Coupon_id"])
+    uc_feat = pd.DataFrame(
+        {
+            "User_id": [u for u, _ in uc_grp.size().index],
+            "Coupon_id": [c for _, c in uc_grp.size().index],
+        }
+    )
+    uc_feat["uc_receive_cnt"] = uc_grp.size().values
+    uc_feat["uc_used_cnt"] = uc_grp["used"].sum().values
+    uc_feat["uc_used_rate"] = safe_divide(
+        uc_feat["uc_used_cnt"], uc_feat["uc_receive_cnt"]
+    )
+    uc_feat["uc_discount_mean"] = uc_grp["discount_rate"].mean().values
+    uc_feat["uc_distance_mean"] = (
+        uc_grp["Distance"].apply(lambda x: x.replace(-1, np.nan).mean()).values
+    )
+
     return {
         "user": user_feat,
         "merchant": merchant_feat,
         "coupon": coupon_feat,
         "um": um_feat,
+        "uc": uc_feat,
     }, data[["User_id", "Coupon_id", "Date_received", "Date"]]
 
 
@@ -405,7 +438,40 @@ def add_user_recency(label_field):
     tmp[["user_gap_since_last", "user_gap_until_next"]] = tmp[
         ["user_gap_since_last", "user_gap_until_next"]
     ].fillna(9999)
-    return tmp[["row_id", "user_gap_since_last", "user_gap_until_next"]]
+    tmp = tmp[["User_id", "row_id", "user_gap_since_last", "user_gap_until_next"]]
+    return tmp
+
+
+def add_um_recency(label_field):
+    """计算同一用户-商家领券的前/后一次间隔天数"""
+    tmp = label_field[["User_id", "Merchant_id", "date_received", "row_id"]].copy()
+    tmp.sort_values(["User_id", "Merchant_id", "date_received", "row_id"], inplace=True)
+    tmp["prev_date"] = tmp.groupby(["User_id", "Merchant_id"])["date_received"].shift(1)
+    tmp["next_date"] = tmp.groupby(["User_id", "Merchant_id"])["date_received"].shift(
+        -1
+    )
+    tmp["um_gap_since_last"] = (tmp["date_received"] - tmp["prev_date"]).dt.days
+    tmp["um_gap_until_next"] = (tmp["next_date"] - tmp["date_received"]).dt.days
+    tmp[["um_gap_since_last", "um_gap_until_next"]] = tmp[
+        ["um_gap_since_last", "um_gap_until_next"]
+    ].fillna(9999)
+    tmp = tmp[["row_id", "um_gap_since_last", "um_gap_until_next"]]
+    return tmp
+
+
+def add_uc_recency(label_field):
+    """计算同一用户-券的前/后一次领取间隔天数"""
+    tmp = label_field[["User_id", "Coupon_id", "date_received", "row_id"]].copy()
+    tmp.sort_values(["User_id", "Coupon_id", "date_received", "row_id"], inplace=True)
+    tmp["prev_date"] = tmp.groupby(["User_id", "Coupon_id"])["date_received"].shift(1)
+    tmp["next_date"] = tmp.groupby(["User_id", "Coupon_id"])["date_received"].shift(-1)
+    tmp["uc_gap_since_last"] = (tmp["date_received"] - tmp["prev_date"]).dt.days
+    tmp["uc_gap_until_next"] = (tmp["next_date"] - tmp["date_received"]).dt.days
+    tmp[["uc_gap_since_last", "uc_gap_until_next"]] = tmp[
+        ["uc_gap_since_last", "uc_gap_until_next"]
+    ].fillna(9999)
+    tmp = tmp[["row_id", "uc_gap_since_last", "uc_gap_until_next"]]
+    return tmp
 
 
 def evaluate_coupon_auc(df, prob_col="prob"):
@@ -428,6 +494,18 @@ def dedup_result(result_df):
     return result_df
 
 
+def blend_results(df_a, df_b, w_a=0.6, w_b=0.4):
+    """按权重融合两个提交结果，权重和需为1"""
+    merged = df_a.merge(
+        df_b,
+        on=["User_id", "Coupon_id", "Date_received"],
+        how="inner",
+        suffixes=("_a", "_b"),
+    )
+    merged["prob"] = merged["prob_a"] * w_a + merged["prob_b"] * w_b
+    return merged[["User_id", "Coupon_id", "Date_received", "prob"]]
+
+
 def get_dataset(history_field, middle_field, label_field, online_feats=None):
     """构造数据集
 
@@ -443,6 +521,8 @@ def get_dataset(history_field, middle_field, label_field, online_feats=None):
     week_feat = get_week_feature(base)
     simple_feat = get_simple_feature(base)
     recency_feat = add_user_recency(base)
+    um_recency_feat = add_um_recency(base)
+    uc_recency_feat = add_uc_recency(base)
     history_full = pd.concat([history_field, middle_field], axis=0)
     history_feats, _ = build_history_features(history_full)
 
@@ -451,7 +531,9 @@ def get_dataset(history_field, middle_field, label_field, online_feats=None):
         set(simple_feat.columns.tolist()) & set(week_feat.columns.tolist())
     )
     dataset = pd.concat([week_feat, simple_feat.drop(share_characters, axis=1)], axis=1)
-    dataset = dataset.merge(recency_feat, on="row_id", how="left")
+    dataset = dataset.merge(recency_feat, on=["row_id", "User_id"], how="left")
+    dataset = dataset.merge(um_recency_feat, on="row_id", how="left")
+    dataset = dataset.merge(uc_recency_feat, on="row_id", how="left")
 
     # 关联历史统计
     if history_feats:
@@ -466,6 +548,10 @@ def get_dataset(history_field, middle_field, label_field, online_feats=None):
         if "um" in history_feats:
             dataset = dataset.merge(
                 history_feats["um"], on=["User_id", "Merchant_id"], how="left"
+            )
+        if "uc" in history_feats:
+            dataset = dataset.merge(
+                history_feats["uc"], on=["User_id", "Coupon_id"], how="left"
             )
 
     # 关联线上统计
@@ -514,52 +600,78 @@ def get_dataset(history_field, middle_field, label_field, online_feats=None):
     return dataset
 
 
-def model_xgb(train, test):
-    """xgb模型
-
-    Args:
-
-    Returns:
-
-    """
-    # xgb参数
+def model_xgb(train, valid=None, test=None):
+    """XGBoost模型，支持验证/测试预测，用于融合"""
     params = {
         "booster": "gbtree",
         "objective": "binary:logistic",
         "eval_metric": "auc",
-        "silent": 1,
-        "eta": 0.01,
-        "max_depth": 5,
+        "eta": 0.05,
+        "max_depth": 6,
         "min_child_weight": 1,
-        "gamma": 0,
-        "lambda": 1,
-        "colsample_bylevel": 0.7,
-        "colsample_bytree": 0.7,
+        "gamma": 0.0,
+        "lambda": 2.0,
+        "colsample_bylevel": 0.8,
+        "colsample_bytree": 0.8,
         "subsample": 0.9,
         "scale_pos_weight": 1,
+        "verbosity": 1,
     }
-    # 数据集
-    dtrain = xgb.DMatrix(
-        train.drop(["User_id", "Coupon_id", "Date_received", "label"], axis=1),
-        label=train["label"],
+
+    feature_cols = [
+        c
+        for c in train.columns
+        if c not in ["User_id", "Coupon_id", "Date_received", "label"]
+    ]
+    print(
+        f"XGBoost 使用特征数: {len(feature_cols)}, 训练样本: {len(train)}, 验证样本: {len(valid) if valid is not None else 0}, 测试样本: {len(test) if test is not None else 0}",
+        flush=True,
     )
-    dtest = xgb.DMatrix(test.drop(["User_id", "Coupon_id", "Date_received"], axis=1))
-    # 训练
+
+    dtrain = xgb.DMatrix(train[feature_cols], label=train["label"])
     watchlist = [(dtrain, "train")]
-    model = xgb.train(params, dtrain, num_boost_round=5167, evals=watchlist)
-    # 预测
-    predict = model.predict(dtest)
-    # 处理结果
-    predict = pd.DataFrame(predict, columns=["prob"])
-    result = pd.concat(
-        [test[["User_id", "Coupon_id", "Date_received"]], predict], axis=1
+    dvalid = None
+    if valid is not None:
+        dvalid = xgb.DMatrix(valid[feature_cols], label=valid["label"])
+        watchlist.append((dvalid, "valid"))
+
+    model = xgb.train(
+        params,
+        dtrain,
+        num_boost_round=3000,
+        evals=watchlist,
+        early_stopping_rounds=200 if dvalid is not None else None,
+        verbose_eval=100,
     )
-    # 特征重要性
+
+    result = {}
+    best_ntree = None
+    if hasattr(model, "best_ntree_limit") and model.best_ntree_limit:
+        best_ntree = model.best_ntree_limit
+    elif hasattr(model, "best_iteration") and model.best_iteration:
+        best_ntree = model.best_iteration
+    else:
+        best_ntree = model.num_boosted_rounds()
+
+    if dvalid is not None:
+        result["valid_prob"] = model.predict(dvalid, iteration_range=(0, best_ntree))
+    if test is not None:
+        dtest = xgb.DMatrix(test[feature_cols])
+        result["test_result"] = pd.concat(
+            [
+                test[["User_id", "Coupon_id", "Date_received"]].copy(),
+                pd.DataFrame(
+                    model.predict(dtest, iteration_range=(0, best_ntree)),
+                    columns=["prob"],
+                ),
+            ],
+            axis=1,
+        )
+
     feat_importance = pd.DataFrame(columns=["feature_name", "importance"])
     feat_importance["feature_name"] = model.get_score().keys()
     feat_importance["importance"] = model.get_score().values()
     feat_importance.sort_values(["importance"], ascending=False, inplace=True)
-    # 返回
     return result, feat_importance
 
 
@@ -573,6 +685,10 @@ def model_lgb(train, valid=None, test=None):
         for c in train.columns
         if c not in ["User_id", "Coupon_id", "Date_received", "label"]
     ]
+    print(
+        f"LightGBM 使用特征数: {len(feature_cols)}, 训练样本: {len(train)}, 验证样本: {len(valid) if valid is not None else 0}",
+        flush=True,
+    )
     dtrain = lgb.Dataset(train[feature_cols], label=train["label"])
 
     valid_sets = [dtrain]
@@ -591,17 +707,17 @@ def model_lgb(train, valid=None, test=None):
         "feature_fraction": 0.85,
         "bagging_fraction": 0.85,
         "bagging_freq": 5,
-        "max_depth": -1,
-        "min_data_in_leaf": 30,
-        "lambda_l1": 0.0,
-        "lambda_l2": 1.0,
-        "min_gain_to_split": 0.0,
+        "max_depth": 7,
+        "min_data_in_leaf": 40,
+        "lambda_l1": 0.05,
+        "lambda_l2": 1.2,
+        "min_gain_to_split": 0.01,
         "verbosity": -1,
     }
 
-    callbacks = [lgb.log_evaluation(200)]
+    callbacks = [lgb.log_evaluation(100)]
     if dvalid is not None:
-        callbacks.append(lgb.early_stopping(100, verbose=False))
+        callbacks.append(lgb.early_stopping(200))
 
     model = lgb.train(
         params,
@@ -723,33 +839,89 @@ if __name__ == "__main__":
     )
 
     # 线下验证（若可用）
+    lgb_offline_auc = None
+    xgb_offline_auc = None
+    lgb_valid_result = None
+    xgb_valid_result = None
+
     if lgb is not None:
         try:
+            print("开始 LightGBM 线下验证...", flush=True)
             lgb_valid_result, _ = model_lgb(train, validate, None)
             validate_pred = validate[
                 ["User_id", "Coupon_id", "Date_received", "label"]
             ].copy()
             validate_pred["prob"] = lgb_valid_result["valid_prob"]
-            offline_auc = evaluate_coupon_auc(validate_pred)
-            print(f"线下按券平均AUC: {offline_auc:.4f}")
+            lgb_offline_auc = evaluate_coupon_auc(validate_pred)
+            print(f"LightGBM 线下按券平均AUC: {lgb_offline_auc:.4f}")
         except Exception as e:
             print(f"LightGBM 线下验证失败: {e}")
-            lgb_valid_result = None
-    else:
-        lgb_valid_result = None
+
+    try:
+        print("开始 XGBoost 线下验证...", flush=True)
+        xgb_valid_result, _ = model_xgb(train, validate, None)
+        validate_pred_xgb = validate[
+            ["User_id", "Coupon_id", "Date_received", "label"]
+        ].copy()
+        validate_pred_xgb["prob"] = xgb_valid_result["valid_prob"]
+        xgb_offline_auc = evaluate_coupon_auc(validate_pred_xgb)
+        print(f"XGBoost 线下按券平均AUC: {xgb_offline_auc:.4f}")
+    except Exception as e:
+        print(f"XGBoost 线下验证失败: {e}")
 
     # 线上训练与预测
     big_train = pd.concat([train, validate], axis=0)
     try:
         if lgb is None:
             raise ImportError("LightGBM 未安装")
-        final_result, feat_importance = model_lgb(big_train, None, test)
-        submission = dedup_result(final_result["test_result"])
-        submission.to_csv(output_path, index=False, header=None)
-        print(f"保存 LightGBM 提交文件: {output_path}")
+        print(
+            f"开始 LightGBM 全量训练，样本数: {len(big_train)}，测试样本: {len(test)}",
+            flush=True,
+        )
+        lgb_final, _ = model_lgb(big_train, None, test)
     except Exception as e:
-        print(f"LightGBM 训练失败，回退 XGBoost: {e}")
-        result, feat_importance = model_xgb(big_train, test)
-        submission = dedup_result(result)
+        print(f"LightGBM 训练失败: {e}")
+        lgb_final = None
+
+    try:
+        print(
+            f"开始 XGBoost 全量训练，样本数: {len(big_train)}，测试样本: {len(test)}",
+            flush=True,
+        )
+        xgb_final, _ = model_xgb(big_train, None, test)
+    except Exception as e:
+        print(f"XGBoost 训练失败: {e}")
+        xgb_final = None
+
+    # 决定融合权重
+    w_lgb = 0.6
+    w_xgb = 0.4
+    if lgb_offline_auc is not None and xgb_offline_auc is not None:
+        total = lgb_offline_auc + xgb_offline_auc
+        if total > 0:
+            w_lgb = lgb_offline_auc / total
+            w_xgb = xgb_offline_auc / total
+    print(f"融合权重: LightGBM {w_lgb:.3f}, XGBoost {w_xgb:.3f}")
+
+    submission = None
+    if lgb_final is not None and xgb_final is not None:
+        blended = blend_results(
+            dedup_result(lgb_final["test_result"]),
+            dedup_result(xgb_final["test_result"]),
+            w_a=w_lgb,
+            w_b=w_xgb,
+        )
+        submission = dedup_result(blended)
+        print("已生成 LightGBM+XGBoost 融合提交")
+    elif lgb_final is not None:
+        submission = dedup_result(lgb_final["test_result"])
+        print("仅使用 LightGBM 提交")
+    elif xgb_final is not None:
+        submission = dedup_result(xgb_final["test_result"])
+        print("仅使用 XGBoost 提交")
+
+    if submission is not None:
         submission.to_csv(output_path, index=False, header=None)
-        print(f"保存 XGBoost 提交文件: {output_path}")
+        print(f"保存提交文件: {output_path}")
+    else:
+        print("未能生成提交文件")
