@@ -555,6 +555,10 @@ def build_recent_window_features(base, history_full, windows=(7, 15, 30)):
                 total, used = _recent_counts(sub_df, hist_dates, used_dates, w)
                 rec[f"{prefix}_recent_receive_{w}"] = total
                 rec[f"{prefix}_recent_used_{w}"] = used
+                # 转化率特征，避免除零
+                rec[f"{prefix}_recent_rate_{w}"] = safe_divide(
+                    pd.Series(used), pd.Series(total)
+                ).to_numpy()
             rows.append(pd.DataFrame(rec))
         if rows:
             feat_block = pd.concat(rows, axis=0)
