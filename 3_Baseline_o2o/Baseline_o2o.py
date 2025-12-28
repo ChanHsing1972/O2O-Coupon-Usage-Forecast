@@ -524,15 +524,15 @@ def _recent_counts(base_group, hist_dates, used_dates, window_days):
     return total, used
 
 
-def build_recent_window_features(base, history_full, window_days=15):
-    """Rolling-window counts for recent behavior to capture时效性."""
-    feats = []
+def build_recent_window_features(base, history_full, windows=(7, 15, 30)):
+    """Rolling-window counts for recent behavior (multi-window)."""
     key_defs = [
         (["User_id"], "user"),
         (["Merchant_id"], "merchant"),
         (["Coupon_id"], "coupon"),
         (["User_id", "Merchant_id"], "um"),
     ]
+    out = pd.DataFrame({"row_id": base["row_id"]})
     for keys, prefix in key_defs:
         hist_grp = history_full.groupby(keys)
         base_sub = base[keys + ["row_id", "date_received"]].copy()
@@ -549,24 +549,17 @@ def build_recent_window_features(base, history_full, window_days=15):
             else:
                 hist_dates = np.array([], dtype="datetime64[ns]")
                 used_dates = np.array([], dtype="datetime64[ns]")
-            total, used = _recent_counts(sub_df, hist_dates, used_dates, window_days)
-            rows.append(
-                pd.DataFrame(
-                    {
-                        "row_id": sub_df["row_id"].to_numpy(),
-                        f"{prefix}_recent_receive_{window_days}": total,
-                        f"{prefix}_recent_used_{window_days}": used,
-                    }
-                )
-            )
+
+            rec = {"row_id": sub_df["row_id"].to_numpy()}
+            for w in windows:
+                total, used = _recent_counts(sub_df, hist_dates, used_dates, w)
+                rec[f"{prefix}_recent_receive_{w}"] = total
+                rec[f"{prefix}_recent_used_{w}"] = used
+            rows.append(pd.DataFrame(rec))
         if rows:
-            feats.append(pd.concat(rows, axis=0))
-    if feats:
-        out = feats[0]
-        for t in feats[1:]:
-            out = out.merge(t, on="row_id", how="left")
-        return out
-    return pd.DataFrame({"row_id": base["row_id"]})
+            feat_block = pd.concat(rows, axis=0)
+            out = out.merge(feat_block, on="row_id", how="left")
+    return out
 
 
 def blend_results(df_a, df_b, w_a=0.6, w_b=0.4):
@@ -600,7 +593,7 @@ def get_dataset(history_field, middle_field, label_field, online_feats=None):
     uc_recency_feat = add_uc_recency(base)
     history_full = pd.concat([history_field, middle_field], axis=0)
     history_feats, _ = build_history_features(history_full)
-    recent_feats = build_recent_window_features(base, history_full, window_days=15)
+    recent_feats = build_recent_window_features(base, history_full, windows=(7, 15, 30))
 
     # 构造数据集
     share_characters = list(
@@ -970,14 +963,17 @@ if __name__ == "__main__":
         print(f"XGBoost 训练失败: {e}")
         xgb_final = None
 
-    # 决定融合权重
-    w_lgb = 0.6
-    w_xgb = 0.4
+    # 决定融合权重（偏向表现更好的模型，设下限/上限避免极端）
+    w_lgb = 0.7
+    w_xgb = 0.3
     if lgb_offline_auc is not None and xgb_offline_auc is not None:
         total = lgb_offline_auc + xgb_offline_auc
         if total > 0:
             w_lgb = lgb_offline_auc / total
             w_xgb = xgb_offline_auc / total
+            # 保持权重在 [0.2, 0.8]，并略微偏向 LightGBM
+            w_lgb = min(max(w_lgb + 0.05, 0.2), 0.8)
+            w_xgb = 1.0 - w_lgb
     print(f"融合权重: LightGBM {w_lgb:.3f}, XGBoost {w_xgb:.3f}")
 
     submission = None
