@@ -494,6 +494,81 @@ def dedup_result(result_df):
     return result_df
 
 
+def _recent_counts(base_group, hist_dates, used_dates, window_days):
+    """Compute rolling counts within past window_days for a subset (numpy arrays)."""
+    if hist_dates.size == 0:
+        return np.zeros(len(base_group), dtype=int), np.zeros(
+            len(base_group), dtype=int
+        )
+    # convert datetimes to day integers
+    hist_int = hist_dates.astype("datetime64[D]").astype(np.int64)
+    used_int = (
+        used_dates.astype("datetime64[D]").astype(np.int64)
+        if used_dates.size
+        else hist_int[:0]
+    )
+    label_int = (
+        base_group["date_received"].to_numpy().astype("datetime64[D]").astype(np.int64)
+    )
+    low = label_int - window_days
+    # counts where low < hist_date < label_date
+    left = np.searchsorted(hist_int, low, side="right")
+    right = np.searchsorted(hist_int, label_int, side="left")
+    total = right - left
+    if used_int.size:
+        l_used = np.searchsorted(used_int, low, side="right")
+        r_used = np.searchsorted(used_int, label_int, side="left")
+        used = r_used - l_used
+    else:
+        used = np.zeros(len(label_int), dtype=int)
+    return total, used
+
+
+def build_recent_window_features(base, history_full, window_days=15):
+    """Rolling-window counts for recent behavior to capture时效性."""
+    feats = []
+    key_defs = [
+        (["User_id"], "user"),
+        (["Merchant_id"], "merchant"),
+        (["Coupon_id"], "coupon"),
+        (["User_id", "Merchant_id"], "um"),
+    ]
+    for keys, prefix in key_defs:
+        hist_grp = history_full.groupby(keys)
+        base_sub = base[keys + ["row_id", "date_received"]].copy()
+        rows = []
+        for k, sub_df in base_sub.groupby(keys):
+            if not isinstance(k, tuple):
+                k = (k,)
+            if k in hist_grp.groups:
+                hist_df = hist_grp.get_group(k)
+                hist_dates = hist_df["date_received"].to_numpy()
+                used_dates = hist_df[hist_df["Date"].notnull()][
+                    "date_received"
+                ].to_numpy()
+            else:
+                hist_dates = np.array([], dtype="datetime64[ns]")
+                used_dates = np.array([], dtype="datetime64[ns]")
+            total, used = _recent_counts(sub_df, hist_dates, used_dates, window_days)
+            rows.append(
+                pd.DataFrame(
+                    {
+                        "row_id": sub_df["row_id"].to_numpy(),
+                        f"{prefix}_recent_receive_{window_days}": total,
+                        f"{prefix}_recent_used_{window_days}": used,
+                    }
+                )
+            )
+        if rows:
+            feats.append(pd.concat(rows, axis=0))
+    if feats:
+        out = feats[0]
+        for t in feats[1:]:
+            out = out.merge(t, on="row_id", how="left")
+        return out
+    return pd.DataFrame({"row_id": base["row_id"]})
+
+
 def blend_results(df_a, df_b, w_a=0.6, w_b=0.4):
     """按权重融合两个提交结果，权重和需为1"""
     merged = df_a.merge(
@@ -525,6 +600,7 @@ def get_dataset(history_field, middle_field, label_field, online_feats=None):
     uc_recency_feat = add_uc_recency(base)
     history_full = pd.concat([history_field, middle_field], axis=0)
     history_feats, _ = build_history_features(history_full)
+    recent_feats = build_recent_window_features(base, history_full, window_days=15)
 
     # 构造数据集
     share_characters = list(
@@ -534,6 +610,7 @@ def get_dataset(history_field, middle_field, label_field, online_feats=None):
     dataset = dataset.merge(recency_feat, on=["row_id", "User_id"], how="left")
     dataset = dataset.merge(um_recency_feat, on="row_id", how="left")
     dataset = dataset.merge(uc_recency_feat, on="row_id", how="left")
+    dataset = dataset.merge(recent_feats, on="row_id", how="left")
 
     # 关联历史统计
     if history_feats:
