@@ -357,12 +357,31 @@ def build_history_features(history_field):
         uc_grp["Distance"].apply(lambda x: x.replace(-1, np.nan).mean()).values
     )
 
+    # 商家-券交互（很多高分方案都有）
+    mc_grp = data.groupby(["Merchant_id", "Coupon_id"])
+    mc_feat = pd.DataFrame(
+        {
+            "Merchant_id": [m for m, _ in mc_grp.size().index],
+            "Coupon_id": [c for _, c in mc_grp.size().index],
+        }
+    )
+    mc_feat["mc_receive_cnt"] = mc_grp.size().values
+    mc_feat["mc_used_cnt"] = mc_grp["used"].sum().values
+    mc_feat["mc_used_rate"] = safe_divide(
+        mc_feat["mc_used_cnt"], mc_feat["mc_receive_cnt"]
+    )
+    mc_feat["mc_discount_mean"] = mc_grp["discount_rate"].mean().values
+    mc_feat["mc_distance_mean"] = (
+        mc_grp["Distance"].apply(lambda x: x.replace(-1, np.nan).mean()).values
+    )
+
     return {
         "user": user_feat,
         "merchant": merchant_feat,
         "coupon": coupon_feat,
         "um": um_feat,
         "uc": uc_feat,
+        "mc": mc_feat,
     }, data[["User_id", "Coupon_id", "Date_received", "Date"]]
 
 
@@ -694,6 +713,10 @@ def get_dataset(history_field, middle_field, label_field, online_feats=None):
         if "uc" in history_feats:
             dataset = dataset.merge(
                 history_feats["uc"], on=["User_id", "Coupon_id"], how="left"
+            )
+        if "mc" in history_feats:
+            dataset = dataset.merge(
+                history_feats["mc"], on=["Merchant_id", "Coupon_id"], how="left"
             )
 
     # 关联线上统计
