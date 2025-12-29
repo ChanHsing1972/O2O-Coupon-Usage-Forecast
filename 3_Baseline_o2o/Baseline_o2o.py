@@ -554,7 +554,12 @@ def _recent_counts(base_group, hist_dates, used_dates, window_days):
     return total, used
 
 
-def build_recent_window_features(base, history_full, windows=(7, 15, 30)):
+def build_recent_window_features(base, history_full, windows=(3, 5, 7, 15, 30)):
+    def build_recent_window_features(base, history_full, windows=(7, 15, 30)):
+        recent_feats = build_recent_window_features(
+            base, history_full, windows=(7, 15, 30)
+        )
+
     """Rolling-window counts for recent behavior (multi-window)."""
     key_defs = [
         (["User_id"], "user"),
@@ -630,7 +635,9 @@ def get_dataset(history_field, middle_field, label_field, online_feats=None):
     seq_feat = add_sequence_features(base)
     history_full = pd.concat([history_field, middle_field], axis=0)
     history_feats, _ = build_history_features(history_full)
-    recent_feats = build_recent_window_features(base, history_full, windows=(7, 15, 30))
+    recent_feats = build_recent_window_features(
+        base, history_full, windows=(3, 5, 7, 15, 30)
+    )
 
     # 构造数据集
     share_characters = list(
