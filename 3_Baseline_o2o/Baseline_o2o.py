@@ -192,6 +192,28 @@ def get_simple_feature(label_field):
     )  # pivot_table后keys会成为index,统计出的特征列会以values即'cnt'命名,将其改名为特征名前缀+特征意义,并将index还原
     feature = pd.merge(feature, pivot, on=keys, how="left")  # 将id列与特征列左连
 
+    # [新增] 用户当天领取特定商家的优惠券数
+    keys = ["User_id", "Merchant_id", "Date_received"]
+    prefixs = "simple_" + "_".join(keys) + "_"
+    pivot = pd.pivot_table(data, index=keys, values="cnt", aggfunc=len)
+    pivot = (
+        pd.DataFrame(pivot)
+        .rename(columns={"cnt": prefixs + "receive_cnt"})
+        .reset_index()
+    )
+    feature = pd.merge(feature, pivot, on=keys, how="left")
+
+    # [新增] 当天全网领券数 (反映节日/大促)
+    keys = ["Date_received"]
+    prefixs = "simple_" + "_".join(keys) + "_"
+    pivot = pd.pivot_table(data, index=keys, values="cnt", aggfunc=len)
+    pivot = (
+        pd.DataFrame(pivot)
+        .rename(columns={"cnt": prefixs + "receive_cnt"})
+        .reset_index()
+    )
+    feature = pd.merge(feature, pivot, on=keys, how="left")
+
     # 用户是否在同一天重复领取了特定优惠券
     keys = ["User_id", "Coupon_id", "Date_received"]  # 主键
     prefixs = "simple_" + "_".join(keys) + "_"  # 特征名前缀,由label_field和主键组成
@@ -881,14 +903,14 @@ def model_xgb(train, valid=None, test=None, n_models=1, seeds=None):
         "booster": "gbtree",
         "objective": "binary:logistic",
         "eval_metric": "auc",
-        "eta": 0.05,
-        "max_depth": 6,
+        "eta": 0.02,
+        "max_depth": 8,
         "min_child_weight": 1,
-        "gamma": 0.0,
+        "gamma": 0.1,
         "lambda": 2.0,
-        "colsample_bylevel": 0.8,
-        "colsample_bytree": 0.8,
-        "subsample": 0.9,
+        "colsample_bylevel": 0.7,
+        "colsample_bytree": 0.7,
+        "subsample": 0.8,
         "scale_pos_weight": 1,
         "verbosity": 1,
     }
@@ -916,7 +938,7 @@ def model_xgb(train, valid=None, test=None, n_models=1, seeds=None):
             xgb.train(
                 params,
                 dtrain,
-                num_boost_round=3000,
+                num_boost_round=4000,
                 evals=watchlist,
                 early_stopping_rounds=200 if dvalid is not None else None,
                 verbose_eval=100,
@@ -931,7 +953,7 @@ def model_xgb(train, valid=None, test=None, n_models=1, seeds=None):
                 xgb.train(
                     params_run,
                     dtrain,
-                    num_boost_round=3000,
+                    num_boost_round=4000,
                     evals=watchlist,
                     early_stopping_rounds=200 if dvalid is not None else None,
                     verbose_eval=100,
@@ -1002,15 +1024,15 @@ def model_lgb(train, valid=None, test=None, n_models=1, seeds=None):
     params = {
         "objective": "binary",
         "metric": "auc",
-        "learning_rate": 0.05,
-        "num_leaves": 63,
-        "feature_fraction": 0.85,
-        "bagging_fraction": 0.85,
+        "learning_rate": 0.02,
+        "num_leaves": 96,
+        "feature_fraction": 0.7,
+        "bagging_fraction": 0.8,
         "bagging_freq": 5,
-        "max_depth": 7,
-        "min_data_in_leaf": 40,
-        "lambda_l1": 0.05,
-        "lambda_l2": 1.2,
+        "max_depth": 9,
+        "min_data_in_leaf": 50,
+        "lambda_l1": 0.1,
+        "lambda_l2": 1.5,
         "min_gain_to_split": 0.01,
         "verbosity": -1,
     }
@@ -1025,7 +1047,7 @@ def model_lgb(train, valid=None, test=None, n_models=1, seeds=None):
             lgb.train(
                 params,
                 dtrain,
-                num_boost_round=2500,
+                num_boost_round=4000,
                 valid_sets=valid_sets,
                 valid_names=valid_names,
                 callbacks=callbacks,
@@ -1040,7 +1062,7 @@ def model_lgb(train, valid=None, test=None, n_models=1, seeds=None):
                 lgb.train(
                     params_run,
                     dtrain,
-                    num_boost_round=2500,
+                    num_boost_round=4000,
                     valid_sets=valid_sets,
                     valid_names=valid_names,
                     callbacks=callbacks,
@@ -1268,15 +1290,15 @@ if __name__ == "__main__":
             params = {
                 "objective": "binary",
                 "metric": "auc",
-                "learning_rate": 0.05,
-                "num_leaves": 63,
-                "feature_fraction": 0.85,
-                "bagging_fraction": 0.85,
+                "learning_rate": 0.02,
+                "num_leaves": 96,
+                "feature_fraction": 0.7,
+                "bagging_fraction": 0.8,
                 "bagging_freq": 5,
-                "max_depth": 7,
-                "min_data_in_leaf": 40,
-                "lambda_l1": 0.05,
-                "lambda_l2": 1.2,
+                "max_depth": 9,
+                "min_data_in_leaf": 50,
+                "lambda_l1": 0.1,
+                "lambda_l2": 1.5,
                 "min_gain_to_split": 0.01,
                 "verbosity": -1,
                 "seed": 2024 + fold,
@@ -1285,9 +1307,9 @@ if __name__ == "__main__":
             model = lgb.train(
                 params,
                 dtrain,
-                num_boost_round=2000,
+                num_boost_round=4000,
                 valid_sets=[dtrain, dval],
-                callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)],
+                callbacks=[lgb.early_stopping(200), lgb.log_evaluation(0)],
             )
 
             oof_lgb[val_idx] = model.predict(X_val, num_iteration=model.best_iteration)
@@ -1312,14 +1334,14 @@ if __name__ == "__main__":
             "booster": "gbtree",
             "objective": "binary:logistic",
             "eval_metric": "auc",
-            "eta": 0.05,
-            "max_depth": 6,
+            "eta": 0.02,
+            "max_depth": 8,
             "min_child_weight": 1,
-            "gamma": 0.0,
+            "gamma": 0.1,
             "lambda": 2.0,
-            "colsample_bylevel": 0.8,
-            "colsample_bytree": 0.8,
-            "subsample": 0.9,
+            "colsample_bylevel": 0.7,
+            "colsample_bytree": 0.7,
+            "subsample": 0.8,
             "scale_pos_weight": 1,
             "verbosity": 0,
             "seed": 2024 + fold,
@@ -1328,9 +1350,9 @@ if __name__ == "__main__":
         model = xgb.train(
             params,
             dtrain,
-            num_boost_round=2000,
+            num_boost_round=4000,
             evals=[(dtrain, "train"), (dval, "valid")],
-            early_stopping_rounds=100,
+            early_stopping_rounds=200,
             verbose_eval=False,
         )
 
