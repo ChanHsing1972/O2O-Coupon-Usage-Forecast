@@ -254,6 +254,34 @@ def safe_divide(numer, denom):
     return (numer / denom).fillna(0)
 
 
+def bayes_smooth_rate(pos_cnt, total_cnt, prior, m=20.0):
+    """贝叶斯平滑： (pos + prior*m) / (total + m)
+
+    - prior: 全局转化率先验（0~1）
+    - m: 先验强度，越大越“向全局靠拢”
+    """
+    pos = pd.to_numeric(pos_cnt, errors="coerce").fillna(0).astype(float)
+    tot = pd.to_numeric(total_cnt, errors="coerce").fillna(0).astype(float)
+    prior = float(prior) if prior is not None else 0.0
+    m = float(m)
+    return (pos + prior * m) / (tot + m)
+
+
+def group_rank_pct(df, group_col, value_col):
+    """组内分位rank，返回[0,1]，缺失时填0.5。"""
+    s = df.groupby(group_col)[value_col].rank(method="average", pct=True)
+    return s.fillna(0.5).astype(float)
+
+
+def group_zscore(df, group_col, value_col):
+    """组内z-score标准化，缺失/方差0时返回0。"""
+    g = df.groupby(group_col)[value_col]
+    mean = g.transform("mean")
+    std = g.transform("std").replace(0, np.nan)
+    z = (df[value_col] - mean) / std
+    return z.fillna(0.0).astype(float)
+
+
 def build_history_features(history_field):
     """从历史区间提取用户/商家/优惠券/交互统计特征"""
     if history_field.empty:
@@ -262,13 +290,16 @@ def build_history_features(history_field):
     data = history_field.copy()
     data["used"] = data["Date"].notnull().astype(int)
 
+    # 全局先验（历史区间整体转化率），用于对稀疏分组做平滑
+    global_prior = float(data["used"].mean()) if len(data) else 0.0
+
     # 用户维度
     user_grp = data.groupby("User_id")
     user_feat = pd.DataFrame({"User_id": user_grp.size().index})
     user_feat["user_receive_cnt"] = user_grp.size().values
     user_feat["user_used_cnt"] = user_grp["used"].sum().values
-    user_feat["user_used_rate"] = safe_divide(
-        user_feat["user_used_cnt"], user_feat["user_receive_cnt"]
+    user_feat["user_used_rate"] = bayes_smooth_rate(
+        user_feat["user_used_cnt"], user_feat["user_receive_cnt"], global_prior, m=20
     )
     user_feat["user_merchant_cnt"] = user_grp["Merchant_id"].nunique().values
     user_feat["user_coupon_cnt"] = user_grp["Coupon_id"].nunique().values
@@ -294,8 +325,11 @@ def build_history_features(history_field):
     merchant_feat = pd.DataFrame({"Merchant_id": merchant_grp.size().index})
     merchant_feat["merchant_receive_cnt"] = merchant_grp.size().values
     merchant_feat["merchant_used_cnt"] = merchant_grp["used"].sum().values
-    merchant_feat["merchant_used_rate"] = safe_divide(
-        merchant_feat["merchant_used_cnt"], merchant_feat["merchant_receive_cnt"]
+    merchant_feat["merchant_used_rate"] = bayes_smooth_rate(
+        merchant_feat["merchant_used_cnt"],
+        merchant_feat["merchant_receive_cnt"],
+        global_prior,
+        m=20,
     )
     merchant_feat["merchant_user_cnt"] = merchant_grp["User_id"].nunique().values
     merchant_feat["merchant_coupon_cnt"] = merchant_grp["Coupon_id"].nunique().values
@@ -312,8 +346,11 @@ def build_history_features(history_field):
     coupon_feat = pd.DataFrame({"Coupon_id": coupon_grp.size().index})
     coupon_feat["coupon_receive_cnt"] = coupon_grp.size().values
     coupon_feat["coupon_used_cnt"] = coupon_grp["used"].sum().values
-    coupon_feat["coupon_used_rate"] = safe_divide(
-        coupon_feat["coupon_used_cnt"], coupon_feat["coupon_receive_cnt"]
+    coupon_feat["coupon_used_rate"] = bayes_smooth_rate(
+        coupon_feat["coupon_used_cnt"],
+        coupon_feat["coupon_receive_cnt"],
+        global_prior,
+        m=20,
     )
     coupon_feat["coupon_discount"] = coupon_grp["discount_rate"].mean().values
     coupon_feat["coupon_high_discount_ratio"] = safe_divide(
@@ -331,8 +368,8 @@ def build_history_features(history_field):
     )
     um_feat["um_receive_cnt"] = um_grp.size().values
     um_feat["um_used_cnt"] = um_grp["used"].sum().values
-    um_feat["um_used_rate"] = safe_divide(
-        um_feat["um_used_cnt"], um_feat["um_receive_cnt"]
+    um_feat["um_used_rate"] = bayes_smooth_rate(
+        um_feat["um_used_cnt"], um_feat["um_receive_cnt"], global_prior, m=20
     )
     um_feat["um_discount_mean"] = um_grp["discount_rate"].mean().values
     um_feat["um_distance_mean"] = (
@@ -349,8 +386,8 @@ def build_history_features(history_field):
     )
     uc_feat["uc_receive_cnt"] = uc_grp.size().values
     uc_feat["uc_used_cnt"] = uc_grp["used"].sum().values
-    uc_feat["uc_used_rate"] = safe_divide(
-        uc_feat["uc_used_cnt"], uc_feat["uc_receive_cnt"]
+    uc_feat["uc_used_rate"] = bayes_smooth_rate(
+        uc_feat["uc_used_cnt"], uc_feat["uc_receive_cnt"], global_prior, m=20
     )
     uc_feat["uc_discount_mean"] = uc_grp["discount_rate"].mean().values
     uc_feat["uc_distance_mean"] = (
@@ -367,8 +404,8 @@ def build_history_features(history_field):
     )
     mc_feat["mc_receive_cnt"] = mc_grp.size().values
     mc_feat["mc_used_cnt"] = mc_grp["used"].sum().values
-    mc_feat["mc_used_rate"] = safe_divide(
-        mc_feat["mc_used_cnt"], mc_feat["mc_receive_cnt"]
+    mc_feat["mc_used_rate"] = bayes_smooth_rate(
+        mc_feat["mc_used_cnt"], mc_feat["mc_receive_cnt"], global_prior, m=20
     )
     mc_feat["mc_discount_mean"] = mc_grp["discount_rate"].mean().values
     mc_feat["mc_distance_mean"] = (
@@ -468,7 +505,10 @@ def build_coupon_weekday_rates(history_full):
     grp = df.groupby(["Coupon_id", "week"])  # 按券+星期分组
     out = grp["used"].agg(["sum", "count"]).reset_index()
     out.rename(columns={"sum": "used_cnt", "count": "receive_cnt"}, inplace=True)
-    out["coupon_week_used_rate"] = safe_divide(out["used_cnt"], out["receive_cnt"])
+    global_prior = float(df["used"].mean()) if len(df) else 0.0
+    out["coupon_week_used_rate"] = bayes_smooth_rate(
+        out["used_cnt"], out["receive_cnt"], global_prior, m=20
+    )
     return out[["Coupon_id", "week", "coupon_week_used_rate"]]
 
 
@@ -601,6 +641,13 @@ def _recent_counts(base_group, hist_dates, used_dates, window_days):
 
 def build_recent_window_features(base, history_full, windows=(7, 15, 30)):
     """Rolling-window counts for recent behavior (multi-window)."""
+    # 全局先验（历史区间整体转化率），用于近期窗口rate平滑
+    global_prior = (
+        float(history_full["Date"].notnull().mean())
+        if history_full is not None and len(history_full)
+        else 0.0
+    )
+    m_smooth = 5.0
     key_defs = [
         (["User_id"], "user"),
         (["Merchant_id"], "merchant"),
@@ -632,10 +679,10 @@ def build_recent_window_features(base, history_full, windows=(7, 15, 30)):
                 total, used = _recent_counts(sub_df, hist_dates, used_dates, w)
                 rec[f"{prefix}_recent_receive_{w}"] = total
                 rec[f"{prefix}_recent_used_{w}"] = used
-                # 转化率特征，避免除零
-                rec[f"{prefix}_recent_rate_{w}"] = safe_divide(
-                    pd.Series(used), pd.Series(total)
-                ).to_numpy()
+                # 转化率特征：贝叶斯平滑，减少稀疏噪声
+                rec[f"{prefix}_recent_rate_{w}"] = (
+                    used.astype(float) + global_prior * m_smooth
+                ) / (total.astype(float) + m_smooth)
             rows.append(pd.DataFrame(rec))
         if rows:
             feat_block = pd.concat(rows, axis=0)
@@ -800,48 +847,51 @@ def model_xgb(train, valid=None, test=None, n_models=1, seeds=None):
         dvalid = xgb.DMatrix(valid[feature_cols], label=valid["label"])
         watchlist.append((dvalid, "valid"))
 
-    # 多种子集成
+    # 多种子集成（不做扰动，避免线上不一致）
     if seeds is None or n_models <= 1:
-        model = xgb.train(
-            params,
-            dtrain,
-            num_boost_round=3000,
-            evals=watchlist,
-            early_stopping_rounds=200 if dvalid is not None else None,
-            verbose_eval=100,
-        )
-        models = [model]
-    else:
-        models = []
-        for i, sd in enumerate(seeds[:n_models]):
-            params_run = dict(params)
-            params_run["seed"] = int(sd)
-            model = xgb.train(
-                params_run,
+        models = [
+            xgb.train(
+                params,
                 dtrain,
                 num_boost_round=3000,
                 evals=watchlist,
                 early_stopping_rounds=200 if dvalid is not None else None,
                 verbose_eval=100,
             )
-            models.append(model)
+        ]
+    else:
+        models = []
+        for sd in seeds[:n_models]:
+            params_run = dict(params)
+            params_run["seed"] = int(sd)
+            models.append(
+                xgb.train(
+                    params_run,
+                    dtrain,
+                    num_boost_round=3000,
+                    evals=watchlist,
+                    early_stopping_rounds=200 if dvalid is not None else None,
+                    verbose_eval=100,
+                )
+            )
 
     result = {}
-    # 聚合预测
     valid_preds = []
     test_preds = []
-    for model in models:
-        if hasattr(model, "best_ntree_limit") and model.best_ntree_limit:
-            best_ntree = model.best_ntree_limit
-        elif hasattr(model, "best_iteration") and model.best_iteration:
-            best_ntree = model.best_iteration
+    for m in models:
+        if hasattr(m, "best_ntree_limit") and m.best_ntree_limit:
+            best_ntree = m.best_ntree_limit
+        elif hasattr(m, "best_iteration") and m.best_iteration:
+            best_ntree = m.best_iteration
         else:
-            best_ntree = model.num_boosted_rounds()
+            best_ntree = m.num_boosted_rounds()
+
         if dvalid is not None:
-            valid_preds.append(model.predict(dvalid, iteration_range=(0, best_ntree)))
+            valid_preds.append(m.predict(dvalid, iteration_range=(0, best_ntree)))
         if test is not None:
             dtest = xgb.DMatrix(test[feature_cols])
-            test_preds.append(model.predict(dtest, iteration_range=(0, best_ntree)))
+            test_preds.append(m.predict(dtest, iteration_range=(0, best_ntree)))
+
     if valid_preds:
         result["valid_prob"] = np.mean(np.vstack(valid_preds), axis=0)
     if test_preds:
@@ -853,10 +903,12 @@ def model_xgb(train, valid=None, test=None, n_models=1, seeds=None):
             axis=1,
         )
 
-    feat_importance = pd.DataFrame(columns=["feature_name", "importance"])
-    feat_importance["feature_name"] = model.get_score().keys()
-    feat_importance["importance"] = model.get_score().values()
-    feat_importance.sort_values(["importance"], ascending=False, inplace=True)
+    # 重要性（取最后一个模型）
+    last_model = models[-1]
+    score = last_model.get_score()
+    feat_importance = pd.DataFrame(
+        {"feature_name": list(score.keys()), "importance": list(score.values())}
+    ).sort_values("importance", ascending=False)
     return result, feat_importance
 
 
@@ -904,31 +956,33 @@ def model_lgb(train, valid=None, test=None, n_models=1, seeds=None):
     if dvalid is not None:
         callbacks.append(lgb.early_stopping(200))
 
-    # 多种子集成
-    models = []
+    # 多种子集成（不做扰动，避免线上不一致）
     if seeds is None or n_models <= 1:
-        model = lgb.train(
-            params,
-            dtrain,
-            num_boost_round=2500,
-            valid_sets=valid_sets,
-            valid_names=valid_names,
-            callbacks=callbacks,
-        )
-        models = [model]
-    else:
-        for sd in seeds[:n_models]:
-            params_run = dict(params)
-            params_run["seed"] = int(sd)
-            model = lgb.train(
-                params_run,
+        models = [
+            lgb.train(
+                params,
                 dtrain,
                 num_boost_round=2500,
                 valid_sets=valid_sets,
                 valid_names=valid_names,
                 callbacks=callbacks,
             )
-            models.append(model)
+        ]
+    else:
+        models = []
+        for sd in seeds[:n_models]:
+            params_run = dict(params)
+            params_run["seed"] = int(sd)
+            models.append(
+                lgb.train(
+                    params_run,
+                    dtrain,
+                    num_boost_round=2500,
+                    valid_sets=valid_sets,
+                    valid_names=valid_names,
+                    callbacks=callbacks,
+                )
+            )
 
     result = {}
     valid_preds = []
@@ -955,10 +1009,11 @@ def model_lgb(train, valid=None, test=None, n_models=1, seeds=None):
             [test[["User_id", "Coupon_id", "Date_received"]], predict], axis=1
         )
 
+    last_model = models[-1]
     feat_importance = pd.DataFrame(
         {
-            "feature_name": model.feature_name(),
-            "importance": model.feature_importance(importance_type="gain"),
+            "feature_name": last_model.feature_name(),
+            "importance": last_model.feature_importance(importance_type="gain"),
         }
     ).sort_values("importance", ascending=False)
 
@@ -979,6 +1034,7 @@ if __name__ == "__main__":
     off_test = pd.read_csv(test_path, skipinitialspace=True)
     off_train.columns = off_train.columns.str.strip()
     off_test.columns = off_test.columns.str.strip()
+
     # 线上数据用于额外特征
     online_feat_dict = {}
     if online_path.exists():
@@ -996,56 +1052,75 @@ if __name__ == "__main__":
     # 打标
     off_train = get_label(off_train)
 
-    # 划分区间
-    train_history_field = off_train[
-        off_train["date_received"].isin(pd.date_range("2016/3/2", periods=60))
-    ]
-    train_middle_field = off_train[
-        off_train["date"].isin(pd.date_range("2016/5/1", periods=15))
-    ]
-    train_label_field = off_train[
-        off_train["date_received"].isin(pd.date_range("2016/5/16", periods=31))
-    ]
+    # ==========================================
+    # 滑窗构建数据集 (Sliding Window)
+    # ==========================================
 
-    validate_history_field = off_train[
-        off_train["date_received"].isin(pd.date_range("2016/1/16", periods=60))
-    ]
-    validate_middle_field = off_train[
-        off_train["date"].isin(pd.date_range("2016/3/16", periods=15))
-    ]
-    validate_label_field = off_train[
-        off_train["date_received"].isin(pd.date_range("2016/3/31", periods=31))
-    ]
+    # 辅助函数：构建切片
+    def process_window(
+        label_start, label_end, history_start, history_end, label_df=None
+    ):
+        """构建一个时间窗口的数据集"""
+        if label_df is None:
+            label_df = off_train
 
-    test_history_field = off_train[
-        off_train["date_received"].isin(pd.date_range("2016/4/17", periods=60))
-    ]
-    test_middle_field = off_train[
-        off_train["date"].isin(pd.date_range("2016/6/16", periods=15))
-    ]
-    test_label_field = off_test.copy()
+        # 标签区间
+        label_field = label_df[
+            label_df["date_received"].isin(pd.date_range(label_start, label_end))
+        ]
+        # 历史区间
+        history_field = off_train[
+            off_train["date_received"].isin(pd.date_range(history_start, history_end))
+        ]
+        # 中间区间（缓冲，防止穿越，这里设为空，通过日期控制）
+        middle_field = pd.DataFrame()
 
-    # 构造训练集、验证集、测试集
-    print("构造训练集")
-    train = get_dataset(
-        train_history_field,
-        train_middle_field,
-        train_label_field,
-        online_feats=online_feat_dict,
+        print(
+            f"构建窗口: Label[{label_start}~{label_end}], History[{history_start}~{history_end}]"
+        )
+        print(f"Label样本数: {len(label_field)}, History样本数: {len(history_field)}")
+
+        return get_dataset(
+            history_field,
+            middle_field,
+            label_field,
+            online_feats=online_feat_dict,
+        )
+
+    print("开始构建滑窗数据集...")
+
+    # 窗口1: 20160416-20160515 (Label), 20160101-20160413 (History)
+    # 对应 reference dataset1
+    train_1 = process_window("2016/4/16", "2016/5/15", "2016/1/1", "2016/4/13")
+
+    # 窗口2: 20160516-20160615 (Label), 20160201-20160514 (History)
+    # 对应 reference dataset2
+    train_2 = process_window("2016/5/16", "2016/6/15", "2016/2/1", "2016/5/14")
+
+    # 测试集: 20160701-20160731 (Label), 20160315-20160630 (History)
+    # 对应 reference dataset3
+    test = process_window(
+        "2016/7/1", "2016/7/31", "2016/3/15", "2016/6/30", label_df=off_test
     )
-    print("构造验证集")
-    validate = get_dataset(
-        validate_history_field,
-        validate_middle_field,
-        validate_label_field,
-        online_feats=online_feat_dict,
-    )
-    print("构造测试集")
-    test = get_dataset(
-        test_history_field,
-        test_middle_field,
-        test_label_field,
-        online_feats=online_feat_dict,
+
+    # 合并训练集
+    print("合并训练集...")
+    train_full = pd.concat([train_1, train_2], axis=0)
+    train_full.index = range(len(train_full))
+
+    # 验证集策略：使用 train_2 的后半部分作为验证集，或者随机划分
+    # 为了更接近线上分布，使用 train_2 (最近一个月) 作为验证集参考，但训练使用全量
+    # 这里我们采用 train_1 + train_2 (前2周) 训练，train_2 (后2周) 验证
+    # 或者简单点，随机划分，因为我们已经有了时间序列的构造
+    # 更好的方式：Train on (Set1 + Set2), Validate on Set2 (to see recent performance)
+
+    # 划分训练/验证
+    # 方案：使用 train_2 作为验证集来评估模型（因为它最接近测试集），但最终预测使用全量训练
+    validate = train_2.copy()
+    train = train_full.copy()  # 全量训练
+
+    print(
+        f"最终训练集样本数: {len(train)}, 验证集样本数: {len(validate)}, 测试集样本数: {len(test)}"
     )
 
     # 线下验证（若可用）
@@ -1056,44 +1131,54 @@ if __name__ == "__main__":
 
     if lgb is not None:
         try:
-            print("开始 LightGBM 线下验证...", flush=True)
-            lgb_valid_result, _ = model_lgb(
-                train, validate, None, n_models=3, seeds=[2024, 2025, 2026]
+            print("开始 LightGBM 线下验证 (使用最近一个月数据作为验证)...", flush=True)
+            # 注意：这里为了验证效果，我们应该只用 train_1 训练，train_2 验证
+            # 但为了最终提交，我们希望用更多数据。
+            # 折中：先用 train_1 训, train_2 验，看分数；然后用 train_full 训，预测 test
+
+            # 验证阶段
+            lgb_valid_model, _ = model_lgb(
+                train_1, validate, None, n_models=1, seeds=[2024]
             )
             validate_pred = validate[
                 ["User_id", "Coupon_id", "Date_received", "label"]
             ].copy()
-            validate_pred["prob"] = lgb_valid_result["valid_prob"]
+            validate_pred["prob"] = lgb_valid_model["valid_prob"]
             lgb_offline_auc = evaluate_coupon_auc(validate_pred)
-            print(f"LightGBM 线下按券平均AUC: {lgb_offline_auc:.4f}")
+            print(
+                f"LightGBM 线下按券平均AUC (Train:Set1, Valid:Set2): {lgb_offline_auc:.4f}"
+            )
         except Exception as e:
             print(f"LightGBM 线下验证失败: {e}")
 
     try:
-        print("开始 XGBoost 线下验证...", flush=True)
-        xgb_valid_result, _ = model_xgb(
-            train, validate, None, n_models=3, seeds=[2024, 2025, 2026]
+        print("开始 XGBoost 线下验证 (使用最近一个月数据作为验证)...", flush=True)
+        xgb_valid_model, _ = model_xgb(
+            train_1, validate, None, n_models=1, seeds=[2024]
         )
         validate_pred_xgb = validate[
             ["User_id", "Coupon_id", "Date_received", "label"]
         ].copy()
-        validate_pred_xgb["prob"] = xgb_valid_result["valid_prob"]
+        validate_pred_xgb["prob"] = xgb_valid_model["valid_prob"]
         xgb_offline_auc = evaluate_coupon_auc(validate_pred_xgb)
-        print(f"XGBoost 线下按券平均AUC: {xgb_offline_auc:.4f}")
+        print(
+            f"XGBoost 线下按券平均AUC (Train:Set1, Valid:Set2): {xgb_offline_auc:.4f}"
+        )
     except Exception as e:
         print(f"XGBoost 线下验证失败: {e}")
 
-    # 线上训练与预测
-    big_train = pd.concat([train, validate], axis=0)
+    # 线上训练与预测 (使用全量数据 train_full)
+    # 为了防止过拟合，我们可以适当增加正则化，或者使用 stacking
+
     try:
         if lgb is None:
             raise ImportError("LightGBM 未安装")
         print(
-            f"开始 LightGBM 全量训练，样本数: {len(big_train)}，测试样本: {len(test)}",
+            f"开始 LightGBM 全量训练 (Set1+Set2)，样本数: {len(train_full)}",
             flush=True,
         )
         lgb_final, _ = model_lgb(
-            big_train, None, test, n_models=3, seeds=[2024, 2025, 2026]
+            train_full, None, test, n_models=3, seeds=[2024, 2025, 2026]
         )
     except Exception as e:
         print(f"LightGBM 训练失败: {e}")
@@ -1101,69 +1186,45 @@ if __name__ == "__main__":
 
     try:
         print(
-            f"开始 XGBoost 全量训练，样本数: {len(big_train)}，测试样本: {len(test)}",
+            f"开始 XGBoost 全量训练 (Set1+Set2)，样本数: {len(train_full)}",
             flush=True,
         )
         xgb_final, _ = model_xgb(
-            big_train, None, test, n_models=3, seeds=[2024, 2025, 2026]
+            train_full, None, test, n_models=3, seeds=[2024, 2025, 2026]
         )
     except Exception as e:
         print(f"XGBoost 训练失败: {e}")
         xgb_final = None
 
-    # 决定融合权重（偏向表现更好的模型，设下限/上限避免极端）
-    w_lgb = 0.7
-    w_xgb = 0.3
+    # 决定融合权重
+    w_lgb = 0.6
+    w_xgb = 0.4
+    # 如果验证分数可用，动态调整
     if lgb_offline_auc is not None and xgb_offline_auc is not None:
         total = lgb_offline_auc + xgb_offline_auc
         if total > 0:
             w_lgb = lgb_offline_auc / total
             w_xgb = xgb_offline_auc / total
-            # 保持权重在 [0.2, 0.8]，并略微偏向 LightGBM
-            w_lgb = min(max(w_lgb + 0.05, 0.2), 0.8)
+            # 限制权重范围
+            w_lgb = min(max(w_lgb, 0.3), 0.7)
             w_xgb = 1.0 - w_lgb
     print(f"融合权重: LightGBM {w_lgb:.3f}, XGBoost {w_xgb:.3f}")
 
     submission = None
-    # 二阶融合：用验证集预测训练 Logistic 回归，应用到测试集融合
-    if (
-        lgb_final is not None
-        and xgb_final is not None
-        and lgb_valid_result is not None
-        and xgb_valid_result is not None
-    ):
-        try:
-            X_val = np.vstack(
-                [lgb_valid_result["valid_prob"], xgb_valid_result["valid_prob"]]
-            ).T
-            y_val = validate["label"].to_numpy()
-            meta_lr = LogisticRegression(max_iter=1000)
-            meta_lr.fit(X_val, y_val)
 
-            test_merge = dedup_result(lgb_final["test_result"]).merge(
-                dedup_result(xgb_final["test_result"]),
-                on=["User_id", "Coupon_id", "Date_received"],
-                how="inner",
-                suffixes=("_lgb", "_xgb"),
-            )
-            X_test = np.vstack(
-                [test_merge["prob_lgb"].to_numpy(), test_merge["prob_xgb"].to_numpy()]
-            ).T
-            test_merge["prob"] = meta_lr.predict_proba(X_test)[:, 1]
-            submission = dedup_result(
-                test_merge[["User_id", "Coupon_id", "Date_received", "prob"]]
-            )
-            print("已生成 Logistic 二阶融合提交")
-        except Exception as e:
-            print(f"二阶融合失败，回退线性融合: {e}")
-            blended = blend_results(
-                dedup_result(lgb_final["test_result"]),
-                dedup_result(xgb_final["test_result"]),
-                w_a=w_lgb,
-                w_b=w_xgb,
-            )
-            submission = dedup_result(blended)
-            print("已生成 LightGBM+XGBoost 线性融合提交")
+    # 简单线性融合 (因为二阶融合需要同分布的验证集预测，这里全量训练没有验证集预测)
+    # 如果要二阶融合，需要对 train_full 做 KFold 预测，比较耗时。
+    # 这里直接使用线性融合，稳健。
+
+    if lgb_final is not None and xgb_final is not None:
+        blended = blend_results(
+            dedup_result(lgb_final["test_result"]),
+            dedup_result(xgb_final["test_result"]),
+            w_a=w_lgb,
+            w_b=w_xgb,
+        )
+        submission = dedup_result(blended)
+        print("已生成 LightGBM+XGBoost 线性融合提交")
     elif lgb_final is not None:
         submission = dedup_result(lgb_final["test_result"])
         print("仅使用 LightGBM 提交")
