@@ -68,11 +68,16 @@ def prepare(dataset):
     )
     # 距离处理
     data["Distance"] = pd.to_numeric(data["Distance"], errors="coerce")
-    data["Distance"].fillna(-1, inplace=True)  # 空距离填充为-1
-    data["null_distance"] = data["Distance"].map(lambda x: 1 if x == -1 else 0)
+    data["Distance"].fillna(11, inplace=True)  # 空距离填充为11（表示很远或未知）
+    data["null_distance"] = data["Distance"].map(lambda x: 1 if x == 11 else 0)
     data["distance_bucket"] = pd.cut(
         data["Distance"], bins=[-np.inf, 0, 1, 2, 4, 9, np.inf], labels=False
     )
+    # 填充Coupon_id
+    data["Coupon_id"] = (
+        pd.to_numeric(data["Coupon_id"], errors="coerce").fillna(0).astype(int)
+    )
+
     # 折扣-距离交互（弱非线性特征）
     try:
         data["discount_x_distance_bucket"] = data["discount_rate"] * data[
@@ -290,37 +295,89 @@ def build_history_features(history_field):
     data = history_field.copy()
     data["used"] = data["Date"].notnull().astype(int)
 
-    # 全局先验（历史区间整体转化率），用于对稀疏分组做平滑
+    # 全局先验
     global_prior = float(data["used"].mean()) if len(data) else 0.0
 
-    # 用户维度
+    # 辅助特征：是否普通消费
+    data["is_regular"] = (data["Coupon_id"] == 0) & (data["Date"].notnull())
+
+    # ==========================================
+    # 1. 用户维度 (User)
+    # ==========================================
     user_grp = data.groupby("User_id")
     user_feat = pd.DataFrame({"User_id": user_grp.size().index})
+
+    # 基础统计
     user_feat["user_receive_cnt"] = user_grp.size().values
     user_feat["user_used_cnt"] = user_grp["used"].sum().values
-    user_feat["user_used_rate"] = bayes_smooth_rate(
-        user_feat["user_used_cnt"], user_feat["user_receive_cnt"], global_prior, m=20
+    user_feat["user_regular_cnt"] = user_grp["is_regular"].sum().values
+    user_feat["user_total_consume_cnt"] = (
+        user_feat["user_used_cnt"] + user_feat["user_regular_cnt"]
     )
-    user_feat["user_merchant_cnt"] = user_grp["Merchant_id"].nunique().values
-    user_feat["user_coupon_cnt"] = user_grp["Coupon_id"].nunique().values
+
+    # 转化率 (贝叶斯平滑)
+    user_feat["user_used_rate"] = bayes_smooth_rate(
+        user_feat["user_used_cnt"], user_feat["user_receive_cnt"], global_prior, m=10
+    )
+    # 优惠券消费占比
+    user_feat["user_coupon_consume_rate"] = safe_divide(
+        user_feat["user_used_cnt"], user_feat["user_total_consume_cnt"]
+    )
+
+    # 距离/折扣统计
     user_feat["user_distance_mean"] = (
-        user_grp["Distance"].apply(lambda x: x.replace(-1, np.nan).mean()).values
+        user_grp["Distance"].apply(lambda x: x.replace(11, np.nan).mean()).values
     )
     user_feat["user_distance_min"] = (
-        user_grp["Distance"].apply(lambda x: x.replace(-1, np.nan).min()).values
-    )
-    user_feat["user_distance_max"] = (
-        user_grp["Distance"].apply(lambda x: x.replace(-1, np.nan).max()).values
+        user_grp["Distance"].apply(lambda x: x.replace(11, np.nan).min()).values
     )
     user_feat["user_discount_mean"] = user_grp["discount_rate"].mean().values
-    user_feat["user_discount_max"] = user_grp["discount_rate"].max().values
-    user_feat["user_high_discount_ratio"] = safe_divide(
-        user_grp["high_discount"].sum().reset_index(drop=True),
-        user_feat["user_receive_cnt"],
-    )
-    user_feat.fillna(0, inplace=True)
 
-    # 商家维度
+    # [新增] 时间间隔特征 (Gap Features)
+    # 计算用户每次消费（普通或券）的时间间隔均值
+    def calc_gap(dates):
+        if len(dates) < 2:
+            return -1
+        dates = sorted(dates)
+        return (dates[-1] - dates[0]).days / (len(dates) - 1)
+
+    # 提取有消费记录的子集
+    # 使用 'date' (datetime类型) 而不是 'Date' (原始类型)
+    consume_data = data[data["date"].notnull()][["User_id", "date", "Coupon_id"]]
+
+    # 普通消费间隔
+    reg_consume = consume_data[consume_data["Coupon_id"] == 0]
+    if not reg_consume.empty:
+        reg_gap = reg_consume.groupby("User_id")["date"].apply(calc_gap).reset_index()
+        reg_gap.columns = ["User_id", "user_regular_gap"]
+        user_feat = user_feat.merge(reg_gap, on="User_id", how="left")
+
+    # 优惠券消费间隔
+    coupon_consume = consume_data[consume_data["Coupon_id"] != 0]
+    if not coupon_consume.empty:
+        coupon_gap = (
+            coupon_consume.groupby("User_id")["date"].apply(calc_gap).reset_index()
+        )
+        coupon_gap.columns = ["User_id", "user_coupon_gap"]
+        user_feat = user_feat.merge(coupon_gap, on="User_id", how="left")
+
+    # 领券到核销的平均间隔 (核销速度)
+    coupon_consume_full = data[
+        (data["Coupon_id"] != 0) & (data["date"].notnull())
+    ].copy()
+    if not coupon_consume_full.empty:
+        coupon_consume_full["gap"] = (
+            coupon_consume_full["date"] - coupon_consume_full["date_received"]
+        ).dt.days
+        avg_gap = coupon_consume_full.groupby("User_id")["gap"].mean().reset_index()
+        avg_gap.columns = ["User_id", "user_avg_consume_gap"]
+        user_feat = user_feat.merge(avg_gap, on="User_id", how="left")
+
+    user_feat.fillna(-1, inplace=True)
+
+    # ==========================================
+    # 2. 商家维度 (Merchant)
+    # ==========================================
     merchant_grp = data.groupby("Merchant_id")
     merchant_feat = pd.DataFrame({"Merchant_id": merchant_grp.size().index})
     merchant_feat["merchant_receive_cnt"] = merchant_grp.size().values
@@ -329,19 +386,25 @@ def build_history_features(history_field):
         merchant_feat["merchant_used_cnt"],
         merchant_feat["merchant_receive_cnt"],
         global_prior,
-        m=20,
+        m=10,
     )
-    merchant_feat["merchant_user_cnt"] = merchant_grp["User_id"].nunique().values
-    merchant_feat["merchant_coupon_cnt"] = merchant_grp["Coupon_id"].nunique().values
-    merchant_feat["merchant_discount_mean"] = (
-        merchant_grp["discount_rate"].mean().values
+    merchant_feat["merchant_distance_mean"] = (
+        merchant_grp["Distance"].apply(lambda x: x.replace(11, np.nan).mean()).values
     )
-    merchant_feat["merchant_high_discount_ratio"] = safe_divide(
-        merchant_grp["high_discount"].sum().reset_index(drop=True),
-        merchant_feat["merchant_receive_cnt"],
-    )
+    # 商家被核销的平均距离 (反映商家热度范围)
+    merchant_used_data = data[(data["used"] == 1) & (data["Distance"] != 11)]
+    if not merchant_used_data.empty:
+        mer_used_dist = (
+            merchant_used_data.groupby("Merchant_id")["Distance"].mean().reset_index()
+        )
+        mer_used_dist.columns = ["Merchant_id", "merchant_redeem_dist_mean"]
+        merchant_feat = merchant_feat.merge(mer_used_dist, on="Merchant_id", how="left")
 
-    # 优惠券维度
+    merchant_feat.fillna(-1, inplace=True)
+
+    # ==========================================
+    # 3. 优惠券维度 (Coupon)
+    # ==========================================
     coupon_grp = data.groupby("Coupon_id")
     coupon_feat = pd.DataFrame({"Coupon_id": coupon_grp.size().index})
     coupon_feat["coupon_receive_cnt"] = coupon_grp.size().values
@@ -350,14 +413,14 @@ def build_history_features(history_field):
         coupon_feat["coupon_used_cnt"],
         coupon_feat["coupon_receive_cnt"],
         global_prior,
-        m=20,
+        m=10,
     )
     coupon_feat["coupon_discount"] = coupon_grp["discount_rate"].mean().values
-    coupon_feat["coupon_high_discount_ratio"] = safe_divide(
-        coupon_grp["high_discount"].sum().reset_index(drop=True),
-        coupon_feat["coupon_receive_cnt"],
-    )
+    coupon_feat.fillna(-1, inplace=True)
 
+    # ==========================================
+    # 4. 交互维度 (UM, UC)
+    # ==========================================
     # 用户-商家交互
     um_grp = data.groupby(["User_id", "Merchant_id"])
     um_feat = pd.DataFrame(
@@ -369,12 +432,9 @@ def build_history_features(history_field):
     um_feat["um_receive_cnt"] = um_grp.size().values
     um_feat["um_used_cnt"] = um_grp["used"].sum().values
     um_feat["um_used_rate"] = bayes_smooth_rate(
-        um_feat["um_used_cnt"], um_feat["um_receive_cnt"], global_prior, m=20
+        um_feat["um_used_cnt"], um_feat["um_receive_cnt"], global_prior, m=10
     )
-    um_feat["um_discount_mean"] = um_grp["discount_rate"].mean().values
-    um_feat["um_distance_mean"] = (
-        um_grp["Distance"].apply(lambda x: x.replace(-1, np.nan).mean()).values
-    )
+    um_feat.fillna(-1, inplace=True)
 
     # 用户-券交互
     uc_grp = data.groupby(["User_id", "Coupon_id"])
@@ -387,12 +447,9 @@ def build_history_features(history_field):
     uc_feat["uc_receive_cnt"] = uc_grp.size().values
     uc_feat["uc_used_cnt"] = uc_grp["used"].sum().values
     uc_feat["uc_used_rate"] = bayes_smooth_rate(
-        uc_feat["uc_used_cnt"], uc_feat["uc_receive_cnt"], global_prior, m=20
+        uc_feat["uc_used_cnt"], uc_feat["uc_receive_cnt"], global_prior, m=10
     )
-    uc_feat["uc_discount_mean"] = uc_grp["discount_rate"].mean().values
-    uc_feat["uc_distance_mean"] = (
-        uc_grp["Distance"].apply(lambda x: x.replace(-1, np.nan).mean()).values
-    )
+    uc_feat.fillna(-1, inplace=True)
 
     # 商家-券交互（很多高分方案都有）
     mc_grp = data.groupby(["Merchant_id", "Coupon_id"])
@@ -405,12 +462,18 @@ def build_history_features(history_field):
     mc_feat["mc_receive_cnt"] = mc_grp.size().values
     mc_feat["mc_used_cnt"] = mc_grp["used"].sum().values
     mc_feat["mc_used_rate"] = bayes_smooth_rate(
-        mc_feat["mc_used_cnt"], mc_feat["mc_receive_cnt"], global_prior, m=20
+        mc_feat["mc_used_cnt"], mc_feat["mc_receive_cnt"], global_prior, m=10
     )
-    mc_feat["mc_discount_mean"] = mc_grp["discount_rate"].mean().values
-    mc_feat["mc_distance_mean"] = (
-        mc_grp["Distance"].apply(lambda x: x.replace(-1, np.nan).mean()).values
-    )
+    mc_feat.fillna(-1, inplace=True)
+
+    return {
+        "user": user_feat,
+        "merchant": merchant_feat,
+        "coupon": coupon_feat,
+        "um": um_feat,
+        "uc": uc_feat,
+        "mc": mc_feat,
+    }, data[["User_id", "Coupon_id", "Date_received", "Date"]]
 
     return {
         "user": user_feat,
@@ -1167,73 +1230,145 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"XGBoost 线下验证失败: {e}")
 
-    # 线上训练与预测 (使用全量数据 train_full)
-    # 为了防止过拟合，我们可以适当增加正则化，或者使用 stacking
+    # ==========================================
+    # 5-Fold Stacking
+    # ==========================================
+    from sklearn.model_selection import StratifiedKFold
 
-    try:
-        if lgb is None:
-            raise ImportError("LightGBM 未安装")
-        print(
-            f"开始 LightGBM 全量训练 (Set1+Set2)，样本数: {len(train_full)}",
-            flush=True,
+    print("开始 5-Fold Stacking...", flush=True)
+
+    # 准备数据
+    feature_cols = [
+        c
+        for c in train_full.columns
+        if c not in ["User_id", "Coupon_id", "Date_received", "label"]
+    ]
+    X = train_full[feature_cols]
+    y = train_full["label"]
+    X_test = test[feature_cols]
+
+    # 存储 OOF 预测和测试集预测
+    oof_lgb = np.zeros(len(train_full))
+    oof_xgb = np.zeros(len(train_full))
+    test_pred_lgb = np.zeros(len(test))
+    test_pred_xgb = np.zeros(len(test))
+
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=2024)
+
+    # LightGBM CV
+    if lgb is not None:
+        print("Running LightGBM CV...", flush=True)
+        for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
+            X_tr, y_tr = X.iloc[train_idx], y.iloc[train_idx]
+            X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
+
+            dtrain = lgb.Dataset(X_tr, label=y_tr)
+            dval = lgb.Dataset(X_val, label=y_val)
+
+            params = {
+                "objective": "binary",
+                "metric": "auc",
+                "learning_rate": 0.05,
+                "num_leaves": 63,
+                "feature_fraction": 0.85,
+                "bagging_fraction": 0.85,
+                "bagging_freq": 5,
+                "max_depth": 7,
+                "min_data_in_leaf": 40,
+                "lambda_l1": 0.05,
+                "lambda_l2": 1.2,
+                "min_gain_to_split": 0.01,
+                "verbosity": -1,
+                "seed": 2024 + fold,
+            }
+
+            model = lgb.train(
+                params,
+                dtrain,
+                num_boost_round=2000,
+                valid_sets=[dtrain, dval],
+                callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)],
+            )
+
+            oof_lgb[val_idx] = model.predict(X_val, num_iteration=model.best_iteration)
+            test_pred_lgb += (
+                model.predict(X_test, num_iteration=model.best_iteration) / 5
+            )
+            print(
+                f"Fold {fold+1} LGB AUC: {roc_auc_score(y_val, oof_lgb[val_idx]):.4f}"
+            )
+
+    # XGBoost CV
+    print("Running XGBoost CV...", flush=True)
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
+        X_tr, y_tr = X.iloc[train_idx], y.iloc[train_idx]
+        X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
+
+        dtrain = xgb.DMatrix(X_tr, label=y_tr)
+        dval = xgb.DMatrix(X_val, label=y_val)
+        dtest = xgb.DMatrix(X_test)
+
+        params = {
+            "booster": "gbtree",
+            "objective": "binary:logistic",
+            "eval_metric": "auc",
+            "eta": 0.05,
+            "max_depth": 6,
+            "min_child_weight": 1,
+            "gamma": 0.0,
+            "lambda": 2.0,
+            "colsample_bylevel": 0.8,
+            "colsample_bytree": 0.8,
+            "subsample": 0.9,
+            "scale_pos_weight": 1,
+            "verbosity": 0,
+            "seed": 2024 + fold,
+        }
+
+        model = xgb.train(
+            params,
+            dtrain,
+            num_boost_round=2000,
+            evals=[(dtrain, "train"), (dval, "valid")],
+            early_stopping_rounds=100,
+            verbose_eval=False,
         )
-        lgb_final, _ = model_lgb(
-            train_full, None, test, n_models=3, seeds=[2024, 2025, 2026]
+
+        oof_xgb[val_idx] = model.predict(
+            dval, iteration_range=(0, model.best_iteration + 1)
         )
-    except Exception as e:
-        print(f"LightGBM 训练失败: {e}")
-        lgb_final = None
-
-    try:
-        print(
-            f"开始 XGBoost 全量训练 (Set1+Set2)，样本数: {len(train_full)}",
-            flush=True,
+        test_pred_xgb += (
+            model.predict(dtest, iteration_range=(0, model.best_iteration + 1)) / 5
         )
-        xgb_final, _ = model_xgb(
-            train_full, None, test, n_models=3, seeds=[2024, 2025, 2026]
-        )
-    except Exception as e:
-        print(f"XGBoost 训练失败: {e}")
-        xgb_final = None
+        print(f"Fold {fold+1} XGB AUC: {roc_auc_score(y_val, oof_xgb[val_idx]):.4f}")
 
-    # 决定融合权重
-    w_lgb = 0.6
-    w_xgb = 0.4
-    # 如果验证分数可用，动态调整
-    if lgb_offline_auc is not None and xgb_offline_auc is not None:
-        total = lgb_offline_auc + xgb_offline_auc
-        if total > 0:
-            w_lgb = lgb_offline_auc / total
-            w_xgb = xgb_offline_auc / total
-            # 限制权重范围
-            w_lgb = min(max(w_lgb, 0.3), 0.7)
-            w_xgb = 1.0 - w_lgb
-    print(f"融合权重: LightGBM {w_lgb:.3f}, XGBoost {w_xgb:.3f}")
+    # Stacking (Logistic Regression)
+    print("Training Meta-Learner (Logistic Regression)...", flush=True)
+    X_stack_train = np.vstack([oof_lgb, oof_xgb]).T
+    X_stack_test = np.vstack([test_pred_lgb, test_pred_xgb]).T
 
-    submission = None
+    meta_model = LogisticRegression()
+    meta_model.fit(X_stack_train, y)
 
-    # 简单线性融合 (因为二阶融合需要同分布的验证集预测，这里全量训练没有验证集预测)
-    # 如果要二阶融合，需要对 train_full 做 KFold 预测，比较耗时。
-    # 这里直接使用线性融合，稳健。
+    stack_pred = meta_model.predict_proba(X_stack_test)[:, 1]
 
-    if lgb_final is not None and xgb_final is not None:
-        blended = blend_results(
-            dedup_result(lgb_final["test_result"]),
-            dedup_result(xgb_final["test_result"]),
-            w_a=w_lgb,
-            w_b=w_xgb,
-        )
-        submission = dedup_result(blended)
-        print("已生成 LightGBM+XGBoost 线性融合提交")
-    elif lgb_final is not None:
-        submission = dedup_result(lgb_final["test_result"])
-        print("仅使用 LightGBM 提交")
-    elif xgb_final is not None:
-        submission = dedup_result(xgb_final["test_result"])
-        print("仅使用 XGBoost 提交")
+    # 生成提交
+    submission = test[["User_id", "Coupon_id", "Date_received"]].copy()
+    submission["prob"] = stack_pred
+    submission = dedup_result(submission)
 
-    if submission is not None:
-        submission.to_csv(output_path, index=False, header=None)
-        print(f"保存提交文件: {output_path}")
-    else:
-        print("未能生成提交文件")
+    submission.to_csv(output_path, index=False, header=None)
+    print(f"保存 Stacking 提交文件: {output_path}")
+    print(
+        f"Meta-Learner Coefficients: LGB={meta_model.coef_[0][0]:.4f}, XGB={meta_model.coef_[0][1]:.4f}"
+    )
+
+    # 备份线性融合结果
+    blended_prob = 0.5 * test_pred_lgb + 0.5 * test_pred_xgb
+    submission_blend = test[["User_id", "Coupon_id", "Date_received"]].copy()
+    submission_blend["prob"] = blended_prob
+    submission_blend = dedup_result(submission_blend)
+    submission_blend.to_csv(
+        str(output_path).replace(".csv", "_blend.csv"), index=False, header=None
+    )
+    print("保存线性融合备份: submission_lgb_blend.csv")
