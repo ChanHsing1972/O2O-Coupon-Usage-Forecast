@@ -317,54 +317,80 @@ def build_history_features(history_field):
     data = history_field.copy()
     data["used"] = data["Date"].notnull().astype(int)
 
-    # 全局先验
-    global_prior = float(data["used"].mean()) if len(data) else 0.0
+    # 区分券记录和普通消费记录
+    # 券记录: Coupon_id != 0
+    # 普通消费: Coupon_id == 0
+    coupon_data = data[data["Coupon_id"] != 0].copy()
+    regular_data = data[data["Coupon_id"] == 0].copy()
 
-    # 辅助特征：是否普通消费
-    data["is_regular"] = (data["Coupon_id"] == 0) & (data["Date"].notnull())
+    # 全局先验 (仅基于券)
+    global_prior = float(coupon_data["used"].mean()) if len(coupon_data) else 0.0
 
     # ==========================================
     # 1. 用户维度 (User)
     # ==========================================
-    user_grp = data.groupby("User_id")
-    user_feat = pd.DataFrame({"User_id": user_grp.size().index})
-
-    # 基础统计
-    user_feat["user_receive_cnt"] = user_grp.size().values
-    user_feat["user_used_cnt"] = user_grp["used"].sum().values
-    user_feat["user_regular_cnt"] = user_grp["is_regular"].sum().values
-    user_feat["user_total_consume_cnt"] = (
-        user_feat["user_used_cnt"] + user_feat["user_regular_cnt"]
+    # 基于券数据的统计
+    u_grp = coupon_data.groupby("User_id")
+    user_feat = pd.DataFrame({"User_id": u_grp.size().index})
+    user_feat["user_receive_cnt"] = u_grp.size().values
+    user_feat["user_used_cnt"] = u_grp["used"].sum().values
+    user_feat["user_merchant_count"] = u_grp["Merchant_id"].nunique().values
+    user_feat["user_coupon_count"] = u_grp["Coupon_id"].nunique().values
+    user_feat["user_distance_mean"] = (
+        u_grp["Distance"].apply(lambda x: x.replace(11, np.nan).mean()).values
     )
+    user_feat["user_distance_min"] = (
+        u_grp["Distance"].apply(lambda x: x.replace(11, np.nan).min()).values
+    )
+    user_feat["user_discount_mean"] = u_grp["discount_rate"].mean().values
 
-    # 转化率 (贝叶斯平滑)
+    # 基于普通消费的统计
+    r_grp = regular_data.groupby("User_id")
+    r_feat = pd.DataFrame({"User_id": r_grp.size().index})
+    r_feat["user_regular_cnt"] = r_grp.size().values
+
+    # 合并
+    user_feat = pd.merge(user_feat, r_feat, on="User_id", how="outer")
+
+    # Fill counts
+    cnt_cols = [
+        "user_receive_cnt",
+        "user_used_cnt",
+        "user_regular_cnt",
+        "user_merchant_count",
+        "user_coupon_count",
+    ]
+    user_feat[cnt_cols] = user_feat[cnt_cols].fillna(0)
+
+    # Calculate rates
     user_feat["user_used_rate"] = bayes_smooth_rate(
         user_feat["user_used_cnt"], user_feat["user_receive_cnt"], global_prior, m=10
     )
-    # 优惠券消费占比
+    user_feat["user_total_consume_cnt"] = (
+        user_feat["user_used_cnt"] + user_feat["user_regular_cnt"]
+    )
     user_feat["user_coupon_consume_rate"] = safe_divide(
         user_feat["user_used_cnt"], user_feat["user_total_consume_cnt"]
     )
 
-    # 距离/折扣统计
-    user_feat["user_distance_mean"] = (
-        user_grp["Distance"].apply(lambda x: x.replace(11, np.nan).mean()).values
-    )
-    user_feat["user_distance_min"] = (
-        user_grp["Distance"].apply(lambda x: x.replace(11, np.nan).min()).values
-    )
-    user_feat["user_discount_mean"] = user_grp["discount_rate"].mean().values
+    # 核销过的统计 (User Used Stats)
+    user_used_data = coupon_data[coupon_data["used"] == 1]
+    if not user_used_data.empty:
+        uu_grp = user_used_data.groupby("User_id")
+        uu_feat = pd.DataFrame({"User_id": uu_grp.size().index})
+        uu_feat["user_mean_discount_used"] = uu_grp["discount_rate"].mean().values
+        uu_feat["user_mean_distance_used"] = (
+            uu_grp["Distance"].apply(lambda x: x.replace(11, np.nan).mean()).values
+        )
+        user_feat = user_feat.merge(uu_feat, on="User_id", how="left")
 
     # [新增] 时间间隔特征 (Gap Features)
-    # 计算用户每次消费（普通或券）的时间间隔均值
     def calc_gap(dates):
         if len(dates) < 2:
             return -1
         dates = sorted(dates)
         return (dates[-1] - dates[0]).days / (len(dates) - 1)
 
-    # 提取有消费记录的子集
-    # 使用 'date' (datetime类型) 而不是 'Date' (原始类型)
     consume_data = data[data["date"].notnull()][["User_id", "date", "Coupon_id"]]
 
     # 普通消费间隔
@@ -383,7 +409,7 @@ def build_history_features(history_field):
         coupon_gap.columns = ["User_id", "user_coupon_gap"]
         user_feat = user_feat.merge(coupon_gap, on="User_id", how="left")
 
-    # 领券到核销的平均间隔 (核销速度)
+    # 领券到核销的平均间隔
     coupon_consume_full = data[
         (data["Coupon_id"] != 0) & (data["date"].notnull())
     ].copy()
@@ -400,51 +426,68 @@ def build_history_features(history_field):
     # ==========================================
     # 2. 商家维度 (Merchant)
     # ==========================================
-    merchant_grp = data.groupby("Merchant_id")
-    merchant_feat = pd.DataFrame({"Merchant_id": merchant_grp.size().index})
-    merchant_feat["merchant_receive_cnt"] = merchant_grp.size().values
-    merchant_feat["merchant_used_cnt"] = merchant_grp["used"].sum().values
+    m_grp = coupon_data.groupby("Merchant_id")
+    merchant_feat = pd.DataFrame({"Merchant_id": m_grp.size().index})
+    merchant_feat["merchant_receive_cnt"] = m_grp.size().values
+    merchant_feat["merchant_used_cnt"] = m_grp["used"].sum().values
+    merchant_feat["merchant_distance_mean"] = (
+        m_grp["Distance"].apply(lambda x: x.replace(11, np.nan).mean()).values
+    )
+    merchant_feat["merchant_discount_mean"] = m_grp["discount_rate"].mean().values
+
+    mr_grp = regular_data.groupby("Merchant_id")
+    mr_feat = pd.DataFrame({"Merchant_id": mr_grp.size().index})
+    mr_feat["merchant_regular_cnt"] = mr_grp.size().values
+
+    merchant_feat = pd.merge(merchant_feat, mr_feat, on="Merchant_id", how="outer")
+
+    cnt_cols_m = ["merchant_receive_cnt", "merchant_used_cnt", "merchant_regular_cnt"]
+    merchant_feat[cnt_cols_m] = merchant_feat[cnt_cols_m].fillna(0)
+
     merchant_feat["merchant_used_rate"] = bayes_smooth_rate(
         merchant_feat["merchant_used_cnt"],
         merchant_feat["merchant_receive_cnt"],
         global_prior,
         m=10,
     )
-    merchant_feat["merchant_distance_mean"] = (
-        merchant_grp["Distance"].apply(lambda x: x.replace(11, np.nan).mean()).values
+    merchant_feat["merchant_total_consume_cnt"] = (
+        merchant_feat["merchant_used_cnt"] + merchant_feat["merchant_regular_cnt"]
     )
-    # 商家被核销的平均距离 (反映商家热度范围)
-    merchant_used_data = data[(data["used"] == 1) & (data["Distance"] != 11)]
-    if not merchant_used_data.empty:
-        mer_used_dist = (
-            merchant_used_data.groupby("Merchant_id")["Distance"].mean().reset_index()
-        )
-        mer_used_dist.columns = ["Merchant_id", "merchant_redeem_dist_mean"]
-        merchant_feat = merchant_feat.merge(mer_used_dist, on="Merchant_id", how="left")
+    merchant_feat["merchant_coupon_consume_rate"] = safe_divide(
+        merchant_feat["merchant_used_cnt"], merchant_feat["merchant_total_consume_cnt"]
+    )
+
+    m_used_data = coupon_data[
+        (coupon_data["used"] == 1) & (coupon_data["Distance"] != 11)
+    ]
+    if not m_used_data.empty:
+        mu_dist = m_used_data.groupby("Merchant_id")["Distance"].mean().reset_index()
+        mu_dist.columns = ["Merchant_id", "merchant_redeem_dist_mean"]
+        merchant_feat = merchant_feat.merge(mu_dist, on="Merchant_id", how="left")
 
     merchant_feat.fillna(-1, inplace=True)
 
     # ==========================================
     # 3. 优惠券维度 (Coupon)
     # ==========================================
-    coupon_grp = data.groupby("Coupon_id")
-    coupon_feat = pd.DataFrame({"Coupon_id": coupon_grp.size().index})
-    coupon_feat["coupon_receive_cnt"] = coupon_grp.size().values
-    coupon_feat["coupon_used_cnt"] = coupon_grp["used"].sum().values
+    c_grp = coupon_data.groupby("Coupon_id")
+    coupon_feat = pd.DataFrame({"Coupon_id": c_grp.size().index})
+    coupon_feat["coupon_receive_cnt"] = c_grp.size().values
+    coupon_feat["coupon_used_cnt"] = c_grp["used"].sum().values
     coupon_feat["coupon_used_rate"] = bayes_smooth_rate(
         coupon_feat["coupon_used_cnt"],
         coupon_feat["coupon_receive_cnt"],
         global_prior,
         m=10,
     )
-    coupon_feat["coupon_discount"] = coupon_grp["discount_rate"].mean().values
+    coupon_feat["coupon_discount"] = c_grp["discount_rate"].mean().values
     coupon_feat.fillna(-1, inplace=True)
 
     # ==========================================
-    # 4. 交互维度 (UM, UC)
+    # 4. 交互维度 (UM, UC, MC)
     # ==========================================
-    # 用户-商家交互
-    um_grp = data.groupby(["User_id", "Merchant_id"])
+    # UM
+    um_grp = coupon_data.groupby(["User_id", "Merchant_id"])
     um_feat = pd.DataFrame(
         {
             "User_id": [u for u, _ in um_grp.size().index],
@@ -453,13 +496,61 @@ def build_history_features(history_field):
     )
     um_feat["um_receive_cnt"] = um_grp.size().values
     um_feat["um_used_cnt"] = um_grp["used"].sum().values
+
+    umr_grp = regular_data.groupby(["User_id", "Merchant_id"])
+    umr_feat = pd.DataFrame(
+        {
+            "User_id": [u for u, _ in umr_grp.size().index],
+            "Merchant_id": [m for _, m in umr_grp.size().index],
+        }
+    )
+    umr_feat["um_regular_cnt"] = umr_grp.size().values
+
+    um_feat = pd.merge(um_feat, umr_feat, on=["User_id", "Merchant_id"], how="outer")
+
+    cnt_cols_um = ["um_receive_cnt", "um_used_cnt", "um_regular_cnt"]
+    um_feat[cnt_cols_um] = um_feat[cnt_cols_um].fillna(0)
+
     um_feat["um_used_rate"] = bayes_smooth_rate(
         um_feat["um_used_cnt"], um_feat["um_receive_cnt"], global_prior, m=10
     )
+    um_feat["um_total_consume_cnt"] = um_feat["um_used_cnt"] + um_feat["um_regular_cnt"]
+    um_feat["um_coupon_consume_rate"] = safe_divide(
+        um_feat["um_used_cnt"], um_feat["um_total_consume_cnt"]
+    )
+
+    # UM Ratios
+    um_feat = um_feat.merge(
+        user_feat[["User_id", "user_used_cnt"]], on="User_id", how="left"
+    )
+    um_feat = um_feat.merge(
+        merchant_feat[["Merchant_id", "merchant_used_cnt"]],
+        on="Merchant_id",
+        how="left",
+    )
+    um_feat["um_buy_rate"] = safe_divide(
+        um_feat["um_used_cnt"], um_feat["user_used_cnt"]
+    )
+    um_feat["um_merchant_rate"] = safe_divide(
+        um_feat["um_used_cnt"], um_feat["merchant_used_cnt"]
+    )
+    um_feat["um_visit_rate"] = safe_divide(
+        um_feat["um_used_cnt"], um_feat["um_receive_cnt"]
+    )
+    um_feat.drop(["user_used_cnt", "merchant_used_cnt"], axis=1, inplace=True)
+
+    # UM Ranks
+    um_feat["um_user_rank_in_merchant"] = um_feat.groupby("Merchant_id")[
+        "um_total_consume_cnt"
+    ].rank(ascending=False, method="min")
+    um_feat["um_merchant_rank_in_user"] = um_feat.groupby("User_id")[
+        "um_total_consume_cnt"
+    ].rank(ascending=False, method="min")
+
     um_feat.fillna(-1, inplace=True)
 
-    # 用户-券交互
-    uc_grp = data.groupby(["User_id", "Coupon_id"])
+    # UC
+    uc_grp = coupon_data.groupby(["User_id", "Coupon_id"])
     uc_feat = pd.DataFrame(
         {
             "User_id": [u for u, _ in uc_grp.size().index],
@@ -473,8 +564,8 @@ def build_history_features(history_field):
     )
     uc_feat.fillna(-1, inplace=True)
 
-    # 商家-券交互（很多高分方案都有）
-    mc_grp = data.groupby(["Merchant_id", "Coupon_id"])
+    # MC
+    mc_grp = coupon_data.groupby(["Merchant_id", "Coupon_id"])
     mc_feat = pd.DataFrame(
         {
             "Merchant_id": [m for m, _ in mc_grp.size().index],
@@ -487,15 +578,6 @@ def build_history_features(history_field):
         mc_feat["mc_used_cnt"], mc_feat["mc_receive_cnt"], global_prior, m=10
     )
     mc_feat.fillna(-1, inplace=True)
-
-    return {
-        "user": user_feat,
-        "merchant": merchant_feat,
-        "coupon": coupon_feat,
-        "um": um_feat,
-        "uc": uc_feat,
-        "mc": mc_feat,
-    }, data[["User_id", "Coupon_id", "Date_received", "Date"]]
 
     return {
         "user": user_feat,
@@ -528,6 +610,10 @@ def build_online_features(online_df):
     user_feat["user_online_click"] = user_grp["is_click"].sum().values
     user_feat["user_online_buy"] = user_grp["is_buy"].sum().values
     user_feat["user_online_receive"] = user_grp["is_receive"].sum().values
+    user_feat["user_online_action_count"] = user_grp.size().values
+    user_feat["user_online_distinct_merchant_count"] = (
+        user_grp["Merchant_id"].nunique().values
+    )
     user_feat["user_online_buy_rate"] = safe_divide(
         user_feat["user_online_buy"],
         user_feat["user_online_click"] + user_feat["user_online_receive"],
@@ -538,6 +624,10 @@ def build_online_features(online_df):
     merchant_feat["merchant_online_click"] = merchant_grp["is_click"].sum().values
     merchant_feat["merchant_online_buy"] = merchant_grp["is_buy"].sum().values
     merchant_feat["merchant_online_receive"] = merchant_grp["is_receive"].sum().values
+    merchant_feat["merchant_online_action_count"] = merchant_grp.size().values
+    merchant_feat["merchant_online_distinct_user_count"] = (
+        merchant_grp["User_id"].nunique().values
+    )
     merchant_feat["merchant_online_buy_rate"] = safe_divide(
         merchant_feat["merchant_online_buy"],
         merchant_feat["merchant_online_click"]
@@ -751,6 +841,10 @@ def build_recent_window_features(base, history_full, windows=(7, 15, 30)):
                 k = (k,)
             if k in hist_grp.groups:
                 hist_df = hist_grp.get_group(k)
+                # [Fix] Filter NaT and sort for searchsorted
+                hist_df = hist_df[hist_df["date_received"].notnull()].sort_values(
+                    "date_received"
+                )
                 hist_dates = hist_df["date_received"].to_numpy()
                 used_dates = hist_df[hist_df["Date"].notnull()][
                     "date_received"
@@ -832,6 +926,7 @@ def get_dataset(history_field, middle_field, label_field, online_feats=None):
     if history_feats:
         if "user" in history_feats:
             dataset = dataset.merge(history_feats["user"], on="User_id", how="left")
+
         if "merchant" in history_feats:
             dataset = dataset.merge(
                 history_feats["merchant"], on="Merchant_id", how="left"
@@ -903,7 +998,7 @@ def model_xgb(train, valid=None, test=None, n_models=1, seeds=None):
         "booster": "gbtree",
         "objective": "binary:logistic",
         "eval_metric": "auc",
-        "eta": 0.02,
+        "eta": 0.03,
         "max_depth": 8,
         "min_child_weight": 1,
         "gamma": 0.1,
@@ -938,7 +1033,7 @@ def model_xgb(train, valid=None, test=None, n_models=1, seeds=None):
             xgb.train(
                 params,
                 dtrain,
-                num_boost_round=4000,
+                num_boost_round=3000,
                 evals=watchlist,
                 early_stopping_rounds=200 if dvalid is not None else None,
                 verbose_eval=100,
@@ -953,7 +1048,7 @@ def model_xgb(train, valid=None, test=None, n_models=1, seeds=None):
                 xgb.train(
                     params_run,
                     dtrain,
-                    num_boost_round=4000,
+                    num_boost_round=3000,
                     evals=watchlist,
                     early_stopping_rounds=200 if dvalid is not None else None,
                     verbose_eval=100,
@@ -1024,7 +1119,7 @@ def model_lgb(train, valid=None, test=None, n_models=1, seeds=None):
     params = {
         "objective": "binary",
         "metric": "auc",
-        "learning_rate": 0.02,
+        "learning_rate": 0.03,
         "num_leaves": 96,
         "feature_fraction": 0.7,
         "bagging_fraction": 0.8,
@@ -1047,7 +1142,7 @@ def model_lgb(train, valid=None, test=None, n_models=1, seeds=None):
             lgb.train(
                 params,
                 dtrain,
-                num_boost_round=4000,
+                num_boost_round=3000,
                 valid_sets=valid_sets,
                 valid_names=valid_names,
                 callbacks=callbacks,
@@ -1062,7 +1157,7 @@ def model_lgb(train, valid=None, test=None, n_models=1, seeds=None):
                 lgb.train(
                     params_run,
                     dtrain,
-                    num_boost_round=4000,
+                    num_boost_round=3000,
                     valid_sets=valid_sets,
                     valid_names=valid_names,
                     callbacks=callbacks,
@@ -1154,9 +1249,17 @@ if __name__ == "__main__":
             label_df["date_received"].isin(pd.date_range(label_start, label_end))
         ]
         # 历史区间
-        history_field = off_train[
-            off_train["date_received"].isin(pd.date_range(history_start, history_end))
-        ]
+        # 1. 领券记录 (date_received 在 history_start ~ history_end)
+        cond_coupon = off_train["date_received"].isin(
+            pd.date_range(history_start, history_end)
+        )
+        # 2. 普通消费记录 (date 在 history_start ~ history_end 且 date_received 为空)
+        # 注意：prepare中 date_received 为 NaT
+        cond_regular = (
+            off_train["date"].isin(pd.date_range(history_start, history_end))
+        ) & (off_train["date_received"].isnull())
+
+        history_field = off_train[cond_coupon | cond_regular]
         # 中间区间（缓冲，防止穿越，这里设为空，通过日期控制）
         middle_field = pd.DataFrame()
 
@@ -1290,7 +1393,7 @@ if __name__ == "__main__":
             params = {
                 "objective": "binary",
                 "metric": "auc",
-                "learning_rate": 0.02,
+                "learning_rate": 0.03,
                 "num_leaves": 96,
                 "feature_fraction": 0.7,
                 "bagging_fraction": 0.8,
@@ -1307,7 +1410,7 @@ if __name__ == "__main__":
             model = lgb.train(
                 params,
                 dtrain,
-                num_boost_round=4000,
+                num_boost_round=3000,
                 valid_sets=[dtrain, dval],
                 callbacks=[lgb.early_stopping(200), lgb.log_evaluation(0)],
             )
@@ -1334,7 +1437,7 @@ if __name__ == "__main__":
             "booster": "gbtree",
             "objective": "binary:logistic",
             "eval_metric": "auc",
-            "eta": 0.02,
+            "eta": 0.03,
             "max_depth": 8,
             "min_child_weight": 1,
             "gamma": 0.1,
@@ -1350,7 +1453,7 @@ if __name__ == "__main__":
         model = xgb.train(
             params,
             dtrain,
-            num_boost_round=4000,
+            num_boost_round=3000,
             evals=[(dtrain, "train"), (dval, "valid")],
             early_stopping_rounds=200,
             verbose_eval=False,
