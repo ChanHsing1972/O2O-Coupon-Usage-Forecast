@@ -78,6 +78,59 @@ def prepare(dataset):
         pd.to_numeric(data["Coupon_id"], errors="coerce").fillna(0).astype(int)
     )
 
+    # [新增] Discount_type 编码 (参考 wepe)
+    discount_types = [
+        "0.2",
+        "0.5",
+        "0.6",
+        "0.7",
+        "0.75",
+        "0.8",
+        "0.85",
+        "0.9",
+        "0.95",
+        "30:20",
+        "50:30",
+        "10:5",
+        "20:10",
+        "100:50",
+        "200:100",
+        "50:20",
+        "30:10",
+        "150:50",
+        "100:30",
+        "20:5",
+        "200:50",
+        "5:1",
+        "50:10",
+        "100:20",
+        "150:30",
+        "30:5",
+        "300:50",
+        "200:30",
+        "150:20",
+        "10:1",
+        "50:5",
+        "100:10",
+        "200:20",
+        "300:30",
+        "150:10",
+        "300:20",
+        "500:30",
+        "20:1",
+        "100:5",
+        "200:10",
+        "30:1",
+        "150:5",
+        "300:10",
+        "200:5",
+        "50:1",
+        "100:1",
+    ]
+    data["discount_type"] = -1
+    for k, v in enumerate(discount_types):
+        data.loc[data["Discount_rate"] == v, "discount_type"] = k
+
     # 折扣-距离交互（弱非线性特征）
     try:
         data["discount_x_distance_bucket"] = data["discount_rate"] * data[
@@ -379,10 +432,29 @@ def build_history_features(history_field):
         uu_grp = user_used_data.groupby("User_id")
         uu_feat = pd.DataFrame({"User_id": uu_grp.size().index})
         uu_feat["user_mean_discount_used"] = uu_grp["discount_rate"].mean().values
+        uu_feat["user_min_discount_used"] = uu_grp["discount_rate"].min().values
+        uu_feat["user_max_discount_used"] = uu_grp["discount_rate"].max().values
+
         uu_feat["user_mean_distance_used"] = (
             uu_grp["Distance"].apply(lambda x: x.replace(11, np.nan).mean()).values
         )
+        uu_feat["user_min_distance_used"] = (
+            uu_grp["Distance"].apply(lambda x: x.replace(11, np.nan).min()).values
+        )
+        uu_feat["user_max_distance_used"] = (
+            uu_grp["Distance"].apply(lambda x: x.replace(11, np.nan).max()).values
+        )
+
+        uu_feat["user_distinct_coupon_used_count"] = (
+            uu_grp["Coupon_id"].nunique().values
+        )
+
         user_feat = user_feat.merge(uu_feat, on="User_id", how="left")
+
+        # Distinct Coupon Used Rate
+        user_feat["user_distinct_coupon_used_rate"] = safe_divide(
+            user_feat["user_distinct_coupon_used_count"], user_feat["user_coupon_count"]
+        )
 
     # [新增] 时间间隔特征 (Gap Features)
     def calc_gap(dates):
@@ -457,15 +529,42 @@ def build_history_features(history_field):
         merchant_feat["merchant_used_cnt"], merchant_feat["merchant_total_consume_cnt"]
     )
 
-    m_used_data = coupon_data[
-        (coupon_data["used"] == 1) & (coupon_data["Distance"] != 11)
-    ]
+    # [新增] 商家用户留存/活跃特征
+    # merchant_feat["merchant_distinct_user_received_count"] = m_grp["User_id"].nunique().values # Error: Length mismatch
+    temp_nunique = m_grp["User_id"].nunique().reset_index()
+    temp_nunique.columns = ["Merchant_id", "merchant_distinct_user_received_count"]
+    merchant_feat = merchant_feat.merge(temp_nunique, on="Merchant_id", how="left")
+
+    m_used_data = coupon_data[(coupon_data["used"] == 1)]
     if not m_used_data.empty:
-        mu_dist = m_used_data.groupby("Merchant_id")["Distance"].mean().reset_index()
-        mu_dist.columns = ["Merchant_id", "merchant_redeem_dist_mean"]
-        merchant_feat = merchant_feat.merge(mu_dist, on="Merchant_id", how="left")
+        # 商家被多少不同用户核销
+        mu_distinct = (
+            m_used_data.groupby("Merchant_id")["User_id"].nunique().reset_index()
+        )
+        mu_distinct.columns = ["Merchant_id", "merchant_distinct_user_used_count"]
+        merchant_feat = merchant_feat.merge(mu_distinct, on="Merchant_id", how="left")
+
+        # 商家距离特征
+        m_used_dist = m_used_data[m_used_data["Distance"] != 11]
+        if not m_used_dist.empty:
+            mu_dist = (
+                m_used_dist.groupby("Merchant_id")["Distance"].mean().reset_index()
+            )
+            mu_dist.columns = ["Merchant_id", "merchant_redeem_dist_mean"]
+            merchant_feat = merchant_feat.merge(mu_dist, on="Merchant_id", how="left")
 
     merchant_feat.fillna(-1, inplace=True)
+
+    # 商家用户留存率 (核销用户数 / 领券用户数)
+    merchant_feat["merchant_user_retention_rate"] = safe_divide(
+        merchant_feat["merchant_distinct_user_used_count"],
+        merchant_feat["merchant_distinct_user_received_count"],
+    )
+    # 商家平均每个用户核销多少张
+    merchant_feat["merchant_avg_user_usage"] = safe_divide(
+        merchant_feat["merchant_used_cnt"],
+        merchant_feat["merchant_distinct_user_received_count"],
+    )
 
     # ==========================================
     # 3. 优惠券维度 (Coupon)
@@ -481,6 +580,17 @@ def build_history_features(history_field):
         m=10,
     )
     coupon_feat["coupon_discount"] = c_grp["discount_rate"].mean().values
+
+    # [新增] 优惠券平均核销时间
+    c_used_data = coupon_data[coupon_data["used"] == 1].copy()
+    if not c_used_data.empty:
+        c_used_data["gap"] = (
+            c_used_data["date"] - c_used_data["date_received"]
+        ).dt.days
+        c_gap = c_used_data.groupby("Coupon_id")["gap"].mean().reset_index()
+        c_gap.columns = ["Coupon_id", "coupon_avg_redeem_gap"]
+        coupon_feat = coupon_feat.merge(c_gap, on="Coupon_id", how="left")
+
     coupon_feat.fillna(-1, inplace=True)
 
     # ==========================================
@@ -998,14 +1108,14 @@ def model_xgb(train, valid=None, test=None, n_models=1, seeds=None):
         "booster": "gbtree",
         "objective": "binary:logistic",
         "eval_metric": "auc",
-        "eta": 0.03,
-        "max_depth": 8,
-        "min_child_weight": 1,
+        "eta": 0.01,
+        "max_depth": 5,
+        "min_child_weight": 1.1,
         "gamma": 0.1,
-        "lambda": 2.0,
+        "lambda": 10,
         "colsample_bylevel": 0.7,
         "colsample_bytree": 0.7,
-        "subsample": 0.8,
+        "subsample": 0.7,
         "scale_pos_weight": 1,
         "verbosity": 1,
     }
@@ -1119,15 +1229,15 @@ def model_lgb(train, valid=None, test=None, n_models=1, seeds=None):
     params = {
         "objective": "binary",
         "metric": "auc",
-        "learning_rate": 0.03,
-        "num_leaves": 96,
+        "learning_rate": 0.01,
+        "num_leaves": 31,
         "feature_fraction": 0.7,
-        "bagging_fraction": 0.8,
+        "bagging_fraction": 0.7,
         "bagging_freq": 5,
-        "max_depth": 9,
+        "max_depth": 7,
         "min_data_in_leaf": 50,
-        "lambda_l1": 0.1,
-        "lambda_l2": 1.5,
+        "lambda_l1": 1.0,
+        "lambda_l2": 2.5,
         "min_gain_to_split": 0.01,
         "verbosity": -1,
     }
@@ -1393,15 +1503,15 @@ if __name__ == "__main__":
             params = {
                 "objective": "binary",
                 "metric": "auc",
-                "learning_rate": 0.03,
-                "num_leaves": 96,
+                "learning_rate": 0.01,
+                "num_leaves": 31,
                 "feature_fraction": 0.7,
-                "bagging_fraction": 0.8,
+                "bagging_fraction": 0.7,
                 "bagging_freq": 5,
-                "max_depth": 9,
+                "max_depth": 7,
                 "min_data_in_leaf": 50,
-                "lambda_l1": 0.1,
-                "lambda_l2": 1.5,
+                "lambda_l1": 1.0,
+                "lambda_l2": 2.5,
                 "min_gain_to_split": 0.01,
                 "verbosity": -1,
                 "seed": 2024 + fold,
@@ -1437,14 +1547,14 @@ if __name__ == "__main__":
             "booster": "gbtree",
             "objective": "binary:logistic",
             "eval_metric": "auc",
-            "eta": 0.03,
-            "max_depth": 8,
-            "min_child_weight": 1,
+            "eta": 0.01,
+            "max_depth": 5,
+            "min_child_weight": 1.1,
             "gamma": 0.1,
-            "lambda": 2.0,
+            "lambda": 10,
             "colsample_bylevel": 0.7,
             "colsample_bytree": 0.7,
-            "subsample": 0.8,
+            "subsample": 0.7,
             "scale_pos_weight": 1,
             "verbosity": 0,
             "seed": 2024 + fold,
